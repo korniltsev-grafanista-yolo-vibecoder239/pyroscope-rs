@@ -41,7 +41,9 @@ Before committing, always run:
 ```bash
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --manifest-path Cargo.toml
+for manifest in kit/*/Cargo.toml; do
+    cargo test --manifest-path "$manifest"
+done
 ```
 
-All three must pass with no errors before creating a commit.
+All must pass with no errors before creating a commit.
