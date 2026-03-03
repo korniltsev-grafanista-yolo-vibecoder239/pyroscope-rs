@@ -6,6 +6,7 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 use notlibc::eventfd::{EventFd, EventSet, EVENT_SET_CAPACITY};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::thread;
 
@@ -146,27 +147,31 @@ fn event_set_all_16_threads_notify_wait_sees_at_least_one() {
 
 #[test]
 fn drop_closes_fd() {
-    // Strategy: record the /proc/self/fd/<N> symlink target before drop
-    // (it points to "anon_inode:[eventfd]").  After drop the symlink must
-    // either be gone or point to something different.  A parallel test that
-    // reuses the same fd number will point to a different inode type, so
-    // either outcome proves that Drop closed the original fd.
+    // Use inode identity to distinguish "same fd reused" from "drop did not
+    // close": each open file description has a unique inode in /proc/self/fd/.
+    // Two separate EventFd::new() calls produce different inodes even if the
+    // kernel recycles the same fd number.
     let efd = EventFd::new().expect("EventFd::new");
     let fd = efd.as_fd();
     let proc_path = format!("/proc/self/fd/{fd}");
 
-    let target_before = std::fs::read_link(&proc_path)
-        .expect("fd must be visible in /proc/self/fd before drop");
+    let ino_before = std::fs::metadata(&proc_path)
+        .expect("fd must be visible in /proc/self/fd before drop")
+        .ino();
+    println!("drop_closes_fd: fd={fd} inode_before={ino_before}");
 
     drop(efd);
 
-    // After drop: either the link is gone, or it points somewhere else.
-    match std::fs::read_link(&proc_path) {
-        Err(_) => { /* fd gone — pass */ }
-        Ok(target_after) => {
+    // After drop: either the link is gone (fd not reused yet), or it points
+    // to a different file description (different inode → drop did close it).
+    match std::fs::metadata(&proc_path) {
+        Err(e) => { println!("drop_closes_fd: fd={fd} after=<gone> ({e})"); /* pass */ }
+        Ok(meta_after) => {
+            let ino_after = meta_after.ino();
+            println!("drop_closes_fd: fd={fd} inode_after={ino_after}");
             assert_ne!(
-                target_after, target_before,
-                "fd {fd} still points to the same eventfd after drop"
+                ino_after, ino_before,
+                "fd {fd} still has the same inode {ino_before} after drop — Drop did not close it"
             );
         }
     }
@@ -390,24 +395,29 @@ fn event_set_add_same_fd_twice_returns_eexist() {
 
 #[test]
 fn event_set_drop_closes_epoll_fd() {
-    // Same race-free strategy as drop_closes_fd: record the /proc/self/fd/<N>
-    // symlink target before drop, then assert the link is gone or points
-    // elsewhere afterwards.  epoll fds show as "anon_inode:[eventpoll]".
+    // Same inode-based strategy as drop_closes_fd: each epoll instance has a
+    // unique inode in /proc/self/fd/, so recycling the fd number for a new
+    // epoll instance produces a different inode — distinguishable from a
+    // failure to close.
     let set = EventSet::new().unwrap();
     let epfd = set.epoll_fd();
     let proc_path = format!("/proc/self/fd/{epfd}");
 
-    let target_before = std::fs::read_link(&proc_path)
-        .expect("epoll fd must be visible in /proc/self/fd before drop");
+    let ino_before = std::fs::metadata(&proc_path)
+        .expect("epoll fd must be visible in /proc/self/fd before drop")
+        .ino();
+    println!("event_set_drop_closes_epoll_fd: epfd={epfd} inode_before={ino_before}");
 
     drop(set);
 
-    match std::fs::read_link(&proc_path) {
-        Err(_) => { /* fd gone — pass */ }
-        Ok(target_after) => {
+    match std::fs::metadata(&proc_path) {
+        Err(e) => { println!("event_set_drop_closes_epoll_fd: epfd={epfd} after=<gone> ({e})"); /* pass */ }
+        Ok(meta_after) => {
+            let ino_after = meta_after.ino();
+            println!("event_set_drop_closes_epoll_fd: epfd={epfd} inode_after={ino_after}");
             assert_ne!(
-                target_after, target_before,
-                "epoll fd {epfd} still points to the same epoll instance after drop"
+                ino_after, ino_before,
+                "epoll fd {epfd} still has inode {ino_before} after drop — Drop did not close it"
             );
         }
     }
