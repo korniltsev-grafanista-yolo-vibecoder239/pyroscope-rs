@@ -1,9 +1,72 @@
 use std::io::BufRead;
 
+use object::{Object, ObjectSymbol};
+
 #[derive(Debug, PartialEq)]
 pub enum InitError {
     KindasafeInitFailed,
     PythonNotFound,
+    /// `_PyRuntime` or `Py_Version` symbol not found in the ELF dynamic symbol table.
+    /// Corresponds to init error code 3.
+    SymbolNotFound,
+    /// The ELF file could not be parsed.
+    ElfParse,
+    /// Failed to open or mmap the binary file.
+    Io,
+}
+
+/// Absolute runtime addresses of two key CPython symbols, after applying ASLR load bias.
+#[derive(Debug, PartialEq)]
+pub struct ElfSymbols {
+    pub py_runtime_addr: u64,
+    pub py_version_addr: u64,
+}
+
+/// Open and mmap `binary.path`, parse the ELF dynamic symbol table, find
+/// `_PyRuntime` and `Py_Version`, apply the ASLR load bias, and return their
+/// absolute runtime addresses.
+///
+/// Returns [`InitError::SymbolNotFound`] (error code 3) if either symbol is absent.
+pub fn resolve_elf_symbols(binary: &PythonBinary) -> Result<ElfSymbols, InitError> {
+    let file = std::fs::File::open(&binary.path).map_err(|_| InitError::Io)?;
+    // SAFETY: the file is a read-only view of an on-disk ELF; no other code
+    // modifies it during parsing.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|_| InitError::Io)?;
+    resolve_elf_symbols_from_bytes(&mmap, binary.base)
+}
+
+/// Parse ELF dynamic symbols from a byte slice and compute absolute addresses.
+///
+/// `mapped_base` is the address at which the first mapping of this binary
+/// appears in `/proc/self/maps` (i.e. the runtime base after ASLR).
+fn resolve_elf_symbols_from_bytes(data: &[u8], mapped_base: u64) -> Result<ElfSymbols, InitError> {
+    let obj = object::File::parse(data).map_err(|_| InitError::ElfParse)?;
+
+    // load_bias = runtime base − ELF-file base (first LOAD segment vaddr).
+    // For PIE/shared objects p_vaddr is 0, so load_bias == mapped_base.
+    let load_bias = mapped_base.wrapping_sub(obj.relative_address_base());
+
+    let mut py_runtime: Option<u64> = None;
+    let mut py_version: Option<u64> = None;
+
+    for sym in obj.dynamic_symbols() {
+        match sym.name() {
+            Ok("_PyRuntime") => py_runtime = Some(sym.address().wrapping_add(load_bias)),
+            Ok("Py_Version") => py_version = Some(sym.address().wrapping_add(load_bias)),
+            _ => {}
+        }
+        if py_runtime.is_some() && py_version.is_some() {
+            break;
+        }
+    }
+
+    match (py_runtime, py_version) {
+        (Some(py_runtime_addr), Some(py_version_addr)) => Ok(ElfSymbols {
+            py_runtime_addr,
+            py_version_addr,
+        }),
+        _ => Err(InitError::SymbolNotFound),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -326,5 +389,233 @@ mod tests {
 ";
         let bin = run(maps).unwrap();
         assert!(bin.path.contains("libpython3"), "should prefer libpython3");
+    }
+
+    // ── resolve_elf_symbols_from_bytes tests ─────────────────────────────────
+
+    /// Build a minimal ELF64 LE shared object in memory containing exactly the
+    /// symbols requested.  The file has:
+    ///
+    ///   ELF header  (64 B)
+    ///   .dynstr     (variable, at offset 64)
+    ///   .dynsym     (3 × 24 B = 72 B, follows .dynstr)
+    ///   Section header table  (4 × 64 B, follows .dynsym)
+    ///
+    /// No segments, no PT_DYNAMIC.  The `object` crate locates `.dynsym` and
+    /// `.dynstr` by section name when no PT_DYNAMIC is present, which is enough
+    /// for `dynamic_symbols()` to work.
+    fn build_elf_fixture(syms: &[(&str, u64)]) -> Vec<u8> {
+        // ── .dynstr ──────────────────────────────────────────────────────────
+        // Layout:  \0  <name0>\0  <name1>\0  …
+        let mut dynstr: Vec<u8> = vec![0u8]; // index 0 = empty string (null symbol name)
+        let mut name_offsets: Vec<u32> = Vec::new();
+        for (name, _) in syms {
+            name_offsets.push(dynstr.len() as u32);
+            dynstr.extend_from_slice(name.as_bytes());
+            dynstr.push(0);
+        }
+        // Pad .dynstr to 8-byte alignment
+        while !dynstr.len().is_multiple_of(8) {
+            dynstr.push(0);
+        }
+
+        // ── layout constants ─────────────────────────────────────────────────
+        let elf_hdr_size: u64 = 64;
+        let sym_size: u64 = 24; // Elf64_Sym
+        let n_syms: u64 = 1 + syms.len() as u64; // null entry + real entries
+        let shdr_size: u64 = 64; // Elf64_Shdr
+        let n_shdrs: u64 = 4; // NULL, .dynstr, .dynsym, .shstrtab
+
+        let dynstr_off = elf_hdr_size;
+        let dynstr_len = dynstr.len() as u64;
+        let dynsym_off = dynstr_off + dynstr_len;
+        let dynsym_len = n_syms * sym_size;
+
+        // .shstrtab: \0.dynstr\0.dynsym\0.shstrtab\0
+        let shstrtab_raw: &[u8] = b"\x00.dynstr\x00.dynsym\x00.shstrtab\x00";
+        let shstrtab_off = dynsym_off + dynsym_len;
+        let shstrtab_len = shstrtab_raw.len() as u64;
+
+        let shdr_off = shstrtab_off + shstrtab_len;
+
+        // section name indices within .shstrtab
+        let shstrtab_idx_dynstr: u32 = 1; // offset of ".dynstr" in shstrtab_raw
+        let shstrtab_idx_dynsym: u32 = 9; // offset of ".dynsym"
+        let shstrtab_idx_shstrtab: u32 = 17; // offset of ".shstrtab"
+
+        // .shstrtab section index (for e_shstrndx)
+        let shstrndx: u16 = 3;
+
+        // ── ELF header ───────────────────────────────────────────────────────
+        let mut buf: Vec<u8> = Vec::new();
+
+        // e_ident[16]
+        buf.extend_from_slice(b"\x7fELF"); // magic
+        buf.push(2); // EI_CLASS = ELFCLASS64
+        buf.push(1); // EI_DATA  = ELFDATA2LSB
+        buf.push(1); // EI_VERSION = EV_CURRENT
+        buf.push(0); // EI_OSABI = ELFOSABI_NONE
+        buf.extend_from_slice(&[0u8; 8]); // padding
+
+        buf.extend_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        buf.extend_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+        buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        buf.extend_from_slice(&0u64.to_le_bytes()); // e_phoff (no segments)
+        buf.extend_from_slice(&shdr_off.to_le_bytes()); // e_shoff
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        buf.extend_from_slice(&(elf_hdr_size as u16).to_le_bytes()); // e_ehsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_phentsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+        buf.extend_from_slice(&(shdr_size as u16).to_le_bytes()); // e_shentsize
+        buf.extend_from_slice(&(n_shdrs as u16).to_le_bytes()); // e_shnum
+        buf.extend_from_slice(&shstrndx.to_le_bytes()); // e_shstrndx
+
+        assert_eq!(buf.len(), 64);
+
+        // ── .dynstr ──────────────────────────────────────────────────────────
+        buf.extend_from_slice(&dynstr);
+        assert_eq!(buf.len() as u64, dynsym_off);
+
+        // ── .dynsym ──────────────────────────────────────────────────────────
+        // Null symbol entry (all zeros)
+        buf.extend_from_slice(&[0u8; 24]);
+
+        // Real symbol entries: Elf64_Sym { st_name, st_info, st_other, st_shndx, st_value, st_size }
+        for (i, (_name, addr)) in syms.iter().enumerate() {
+            let st_name = name_offsets[i];
+            buf.extend_from_slice(&st_name.to_le_bytes()); // st_name  (u32)
+            buf.push(0x12); // st_info = STB_GLOBAL | STT_OBJECT
+            buf.push(0); // st_other
+            buf.extend_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF (ok for test)
+            buf.extend_from_slice(&addr.to_le_bytes()); // st_value (u64)
+            buf.extend_from_slice(&0u64.to_le_bytes()); // st_size
+        }
+
+        assert_eq!(buf.len() as u64, shstrtab_off);
+
+        // ── .shstrtab ────────────────────────────────────────────────────────
+        buf.extend_from_slice(shstrtab_raw);
+        assert_eq!(buf.len() as u64, shdr_off);
+
+        // ── Section header table ─────────────────────────────────────────────
+        // Helper: write one Elf64_Shdr
+        let write_shdr = |buf: &mut Vec<u8>,
+                          sh_name: u32,
+                          sh_type: u32,
+                          sh_flags: u64,
+                          sh_addr: u64,
+                          sh_offset: u64,
+                          sh_size: u64,
+                          sh_link: u32,
+                          sh_info: u32,
+                          sh_addralign: u64,
+                          sh_entsize: u64| {
+            buf.extend_from_slice(&sh_name.to_le_bytes());
+            buf.extend_from_slice(&sh_type.to_le_bytes());
+            buf.extend_from_slice(&sh_flags.to_le_bytes());
+            buf.extend_from_slice(&sh_addr.to_le_bytes());
+            buf.extend_from_slice(&sh_offset.to_le_bytes());
+            buf.extend_from_slice(&sh_size.to_le_bytes());
+            buf.extend_from_slice(&sh_link.to_le_bytes());
+            buf.extend_from_slice(&sh_info.to_le_bytes());
+            buf.extend_from_slice(&sh_addralign.to_le_bytes());
+            buf.extend_from_slice(&sh_entsize.to_le_bytes());
+        };
+
+        // SHT_NULL
+        write_shdr(&mut buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        // .dynstr  SHT_STRTAB = 3
+        write_shdr(
+            &mut buf,
+            shstrtab_idx_dynstr,
+            3,
+            0,
+            0,
+            dynstr_off,
+            dynstr_len,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        // .dynsym  SHT_DYNSYM = 11
+        // sh_link = index of .dynstr section (1), sh_info = first global symbol index (1)
+        write_shdr(
+            &mut buf,
+            shstrtab_idx_dynsym,
+            11,
+            0,
+            0,
+            dynsym_off,
+            dynsym_len,
+            1,
+            1,
+            8,
+            sym_size,
+        );
+
+        // .shstrtab  SHT_STRTAB = 3
+        write_shdr(
+            &mut buf,
+            shstrtab_idx_shstrtab,
+            3,
+            0,
+            0,
+            shstrtab_off,
+            shstrtab_len,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        buf
+    }
+
+    #[test]
+    fn elf_fixture_both_symbols_found() {
+        let py_runtime_val: u64 = 0x1000;
+        let py_version_val: u64 = 0x2000;
+        let elf = build_elf_fixture(&[
+            ("_PyRuntime", py_runtime_val),
+            ("Py_Version", py_version_val),
+        ]);
+
+        let mapped_base: u64 = 0x7f0000000000;
+        // For an ET_DYN with no PT_LOAD, relative_address_base() returns 0,
+        // so load_bias = mapped_base.
+        let result = resolve_elf_symbols_from_bytes(&elf, mapped_base).unwrap();
+        assert_eq!(result.py_runtime_addr, mapped_base + py_runtime_val);
+        assert_eq!(result.py_version_addr, mapped_base + py_version_val);
+    }
+
+    #[test]
+    fn elf_fixture_missing_py_runtime() {
+        let elf = build_elf_fixture(&[("Py_Version", 0x2000)]);
+        let result = resolve_elf_symbols_from_bytes(&elf, 0x7f0000000000);
+        assert_eq!(result, Err(InitError::SymbolNotFound));
+    }
+
+    #[test]
+    fn elf_fixture_missing_py_version() {
+        let elf = build_elf_fixture(&[("_PyRuntime", 0x1000)]);
+        let result = resolve_elf_symbols_from_bytes(&elf, 0x7f0000000000);
+        assert_eq!(result, Err(InitError::SymbolNotFound));
+    }
+
+    #[test]
+    fn elf_fixture_no_symbols() {
+        let elf = build_elf_fixture(&[]);
+        let result = resolve_elf_symbols_from_bytes(&elf, 0x7f0000000000);
+        assert_eq!(result, Err(InitError::SymbolNotFound));
+    }
+
+    #[test]
+    fn elf_invalid_bytes_returns_elf_parse_error() {
+        let result = resolve_elf_symbols_from_bytes(b"not an elf file", 0x1000);
+        assert_eq!(result, Err(InitError::ElfParse));
     }
 }
