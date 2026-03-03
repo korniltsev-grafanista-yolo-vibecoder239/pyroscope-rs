@@ -254,6 +254,15 @@ impl EventSet {
     }
 }
 
+impl EventSet {
+    /// Return the underlying epoll file descriptor.
+    ///
+    /// The fd remains owned by this `EventSet`; do not close it externally.
+    pub fn epoll_fd(&self) -> i32 {
+        self.epfd
+    }
+}
+
 impl Drop for EventSet {
     fn drop(&mut self) {
         if self.epfd >= 0 {
