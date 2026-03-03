@@ -172,18 +172,21 @@ fn drop_closes_fd() {
     }
 }
 
-/// Global slot written by the SIGPROF handler.
-static SIGNAL_FD: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(-1);
+/// Pointer to the `EventFd` that the SIGPROF handler should call `notify()` on.
+///
+/// Set before raising SIGPROF, cleared immediately after.  The pointee must
+/// outlive the signal handler invocation; we guarantee that because the
+/// `EventFd` is alive on the test thread's stack throughout.
+static SIGNAL_EFD: std::sync::atomic::AtomicPtr<EventFd> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn sigprof_handler(_sig: libc::c_int) {
-    let fd = SIGNAL_FD.load(std::sync::atomic::Ordering::Relaxed);
-    if fd >= 0 {
-        // notify() is async-signal-safe: it uses a direct SYS_write syscall.
-        let val: u64 = 1;
-        unsafe {
-            libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
-        }
+    let ptr = SIGNAL_EFD.load(std::sync::atomic::Ordering::Relaxed);
+    if !ptr.is_null() {
+        // SAFETY: the test guarantees `ptr` is valid for the duration of the
+        // signal handler.  `EventFd::notify()` is async-signal-safe: it uses
+        // a direct inline-asm SYS_write syscall with no heap or locking.
+        unsafe { (*ptr).notify() };
     }
 }
 
@@ -191,8 +194,11 @@ extern "C" fn sigprof_handler(_sig: libc::c_int) {
 fn notify_from_signal_handler() {
     let efd = EventFd::new().expect("EventFd::new");
 
-    // Store the fd so the handler can find it.
-    SIGNAL_FD.store(efd.as_fd(), std::sync::atomic::Ordering::Relaxed);
+    // Make the EventFd reachable from the signal handler.
+    SIGNAL_EFD.store(
+        &efd as *const EventFd as *mut EventFd,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Install SIGPROF handler.
     let sa = libc::sigaction {
@@ -205,16 +211,16 @@ fn notify_from_signal_handler() {
     let ret = unsafe { libc::sigaction(libc::SIGPROF, &sa, &mut old_sa) };
     assert_eq!(ret, 0, "sigaction install failed");
 
-    // Fire the signal synchronously.
+    // Fire the signal synchronously; the handler calls efd.notify().
     unsafe { libc::raise(libc::SIGPROF) };
 
     // Drain the fd — must see exactly 1.
     let count = drain_one(efd.as_fd());
     assert_eq!(count, 1, "expected 1 notification from signal handler, got {count}");
 
-    // Restore the previous handler and clear the global slot.
+    // Restore the previous handler and clear the global pointer.
     unsafe { libc::sigaction(libc::SIGPROF, &old_sa, std::ptr::null_mut()) };
-    SIGNAL_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
+    SIGNAL_EFD.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
 }
 
 #[test]
@@ -348,6 +354,30 @@ fn event_set_multiple_simultaneous_fires_sequential_draining() {
 }
 
 #[test]
+fn event_set_multiple_simultaneous_fires_sequential_draining_from_threads() {
+    // Same as the previous test but notifications come from separate threads.
+    let efds: Vec<Arc<EventFd>> = (0..4).map(|_| Arc::new(EventFd::new().unwrap())).collect();
+    let mut set = EventSet::new().unwrap();
+    for efd in &efds {
+        set.add(efd).unwrap();
+    }
+
+    let n0 = Arc::clone(&efds[0]);
+    let n3 = Arc::clone(&efds[3]);
+    let h0 = thread::spawn(move || n0.notify());
+    let h3 = thread::spawn(move || n3.notify());
+    h0.join().unwrap();
+    h3.join().unwrap();
+
+    let first = set.wait(-1).unwrap();
+    let second = set.wait(-1).unwrap();
+
+    let mut seen = [first, second];
+    seen.sort_unstable();
+    assert_eq!(seen, [0, 3], "expected both index 0 and 3, got {first} and {second}");
+}
+
+#[test]
 fn event_set_add_same_fd_twice_returns_eexist() {
     let efd = EventFd::new().unwrap();
     let mut set = EventSet::new().unwrap();
@@ -360,16 +390,25 @@ fn event_set_add_same_fd_twice_returns_eexist() {
 
 #[test]
 fn event_set_drop_closes_epoll_fd() {
-    // Capture the epoll fd number before dropping, then verify it is invalid
-    // afterwards via fcntl(F_GETFD).  This is race-free: we check a specific
-    // fd number rather than counting all open fds in /proc.
-    let epfd = {
-        let set = EventSet::new().unwrap();
-        set.epoll_fd()
-    };
-    // After drop the epoll fd must be closed.
-    let ret = unsafe { libc::fcntl(epfd, libc::F_GETFD) };
-    assert_eq!(ret, -1, "fcntl should fail on a closed epoll fd");
-    let errno = unsafe { *libc::__errno_location() };
-    assert_eq!(errno, libc::EBADF, "expected EBADF, got errno {errno}");
+    // Same race-free strategy as drop_closes_fd: record the /proc/self/fd/<N>
+    // symlink target before drop, then assert the link is gone or points
+    // elsewhere afterwards.  epoll fds show as "anon_inode:[eventpoll]".
+    let set = EventSet::new().unwrap();
+    let epfd = set.epoll_fd();
+    let proc_path = format!("/proc/self/fd/{epfd}");
+
+    let target_before = std::fs::read_link(&proc_path)
+        .expect("epoll fd must be visible in /proc/self/fd before drop");
+
+    drop(set);
+
+    match std::fs::read_link(&proc_path) {
+        Err(_) => { /* fd gone — pass */ }
+        Ok(target_after) => {
+            assert_ne!(
+                target_after, target_before,
+                "epoll fd {epfd} still points to the same epoll instance after drop"
+            );
+        }
+    }
 }
