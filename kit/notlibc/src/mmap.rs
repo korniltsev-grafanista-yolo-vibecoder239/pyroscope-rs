@@ -24,16 +24,14 @@ mod imp {
     use core::ops::{Deref, DerefMut};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::syscall::{syscall1, syscall2, syscall3, syscall4, syscall6};
+    use crate::syscall::{syscall2, syscall3, syscall6};
+    use crate::auxv::getauxval;
     use super::check;
 
     // ── syscall numbers ────────────────────────────────────────────────────────
     const SYS_MMAP: usize = 9;
     const SYS_MUNMAP: usize = 11;
     const SYS_MPROTECT: usize = 10;
-    const SYS_OPENAT: usize = 257;
-    const SYS_READ: usize = 0;
-    const SYS_CLOSE: usize = 3;
 
     // ── mmap prot / flags constants (Linux x86_64) ─────────────────────────────
     const PROT_READ: usize = 1;
@@ -42,93 +40,16 @@ mod imp {
     const MAP_PRIVATE: usize = 0x02;
     const MAP_ANONYMOUS: usize = 0x20;
 
-    // ── openat constants ───────────────────────────────────────────────────────
-    const AT_FDCWD: usize = (-100_isize) as usize;
-    const O_RDONLY: usize = 0;
-
-    // ── ELF auxiliary vector constants ─────────────────────────────────────────
-    const AT_NULL: usize = 0;
+    // ── ELF auxiliary vector entry type for page size ──────────────────────────
     const AT_PAGESZ: usize = 6;
 
     // ── page size (cached, same pattern as memmap2) ────────────────────────────
-
-    /// Read the page size from `/proc/self/auxv` by scanning for `AT_PAGESZ`.
-    ///
-    /// Returns `None` if the file cannot be opened/read or the entry is absent.
-    fn read_page_size_from_auxv() -> Option<usize> {
-        // "/proc/self/auxv\0" as a byte literal for the openat path argument.
-        const PATH: &[u8] = b"/proc/self/auxv\0";
-
-        let fd = unsafe {
-            check(syscall4(
-                SYS_OPENAT,
-                AT_FDCWD,
-                PATH.as_ptr() as usize,
-                O_RDONLY,
-                0, // mode (ignored for O_RDONLY without O_CREAT)
-            ))
-            .ok()?
-        };
-
-        // Read auxv entries into a stack buffer.  Each entry is two `usize`
-        // words (type, value); the vector ends with AT_NULL (type 0, value 0).
-        // A buffer of 64 entries (1024 bytes on 64-bit) is plenty for the
-        // typical ~20 entries produced by the Linux kernel.
-        const BUF_ENTRIES: usize = 64;
-        const ENTRY_SIZE: usize = core::mem::size_of::<usize>() * 2;
-        const BUF_BYTES: usize = BUF_ENTRIES * ENTRY_SIZE;
-
-        let mut buf = [0u8; BUF_BYTES];
-        let mut result: Option<usize> = None;
-
-        'outer: loop {
-            let n = unsafe {
-                check(syscall3(
-                    SYS_READ,
-                    fd as usize,
-                    buf.as_mut_ptr() as usize,
-                    BUF_BYTES,
-                ))
-            };
-            let n = match n {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n as usize,
-            };
-
-            let available = &buf[..n];
-            let mut i = 0usize;
-            while i + ENTRY_SIZE <= available.len() {
-                // Re-assemble two `usize` values from raw bytes (little-endian
-                // on x86_64).  We use `usize::from_le_bytes` via a fixed-size
-                // copy so the code stays no_std.
-                const WORD: usize = core::mem::size_of::<usize>();
-                let mut a_bytes = [0u8; WORD];
-                let mut v_bytes = [0u8; WORD];
-                a_bytes.copy_from_slice(&available[i..i + WORD]);
-                v_bytes.copy_from_slice(&available[i + WORD..i + 2 * WORD]);
-                let a_type = usize::from_le_bytes(a_bytes);
-                let a_val  = usize::from_le_bytes(v_bytes);
-                i += ENTRY_SIZE;
-
-                if a_type == AT_NULL {
-                    break 'outer;
-                }
-                if a_type == AT_PAGESZ {
-                    result = Some(a_val);
-                    break 'outer;
-                }
-            }
-        }
-
-        unsafe { syscall1(SYS_CLOSE, fd as usize) };
-        result
-    }
 
     pub fn page_size() -> usize {
         static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
         match PAGE_SIZE.load(Ordering::Relaxed) {
             0 => {
-                let ps = read_page_size_from_auxv().unwrap_or(4096);
+                let ps = getauxval(AT_PAGESZ).unwrap_or(4096);
                 PAGE_SIZE.store(ps, Ordering::Relaxed);
                 ps
             }
