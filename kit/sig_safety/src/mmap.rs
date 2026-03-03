@@ -5,12 +5,27 @@
 ///
 /// Only anonymous private mappings are supported (the use-case for
 /// signal-handler–safe scratch buffers).  File-backed maps are out of scope.
+
+/// Convert a raw kernel `isize` return value into `Result`.
+/// Negative values encode `-errno`; non-negative values are success.
+/// Not architecture-specific: the sign convention is the same on all
+/// Linux targets.
+#[inline]
+pub(crate) fn check(ret: isize) -> Result<isize, i32> {
+    if ret < 0 {
+        Err((-ret) as i32)
+    } else {
+        Ok(ret)
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod imp {
     use core::ops::{Deref, DerefMut};
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::syscall::{syscall2, syscall3, syscall6};
+    use super::check;
 
     // ── syscall numbers ────────────────────────────────────────────────────────
     const SYS_MMAP: usize = 9;
@@ -24,30 +39,16 @@ mod imp {
     const MAP_PRIVATE: usize = 0x02;
     const MAP_ANONYMOUS: usize = 0x20;
 
-    // ── errno check helper ─────────────────────────────────────────────────────
-
-    /// Convert a raw kernel `isize` return into `Result`.
-    /// Negative values are `-errno`; non-negative are success.
-    #[inline]
-    fn check(ret: isize) -> Result<usize, i32> {
-        if ret < 0 {
-            Err((-ret) as i32)
-        } else {
-            Ok(ret as usize)
-        }
-    }
-
     // ── page size (cached, same pattern as memmap2) ────────────────────────────
 
     pub fn page_size() -> usize {
         static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
         match PAGE_SIZE.load(Ordering::Relaxed) {
             0 => {
-                // On x86_64 Linux the page size is always 4096; there is no
-                // stable raw-syscall path for sysconf(_SC_PAGESIZE) because
-                // glibc implements it via vDSO/AT_PAGESZ, not a real syscall.
-                // Hard-coding 4096 matches what memmap2 effectively gets on
-                // all x86_64 Linux systems.
+                // TODO: read AT_PAGESZ from /proc/self/auxv instead of
+                // hard-coding. On x86_64 Linux the page size is always 4096,
+                // but reading AT_PAGESZ would be correct on any architecture.
+                // Tracked in: https://github.com/korniltsev-grafanista-yolo-vibecoder239/pyroscope-rs/issues
                 let ps = 4096_usize;
                 PAGE_SIZE.store(ps, Ordering::Relaxed);
                 ps
@@ -87,13 +88,13 @@ mod imp {
             let ptr = unsafe {
                 check(syscall6(
                     SYS_MMAP,
-                    0,                          // addr  = NULL → kernel chooses
-                    map_len,                    // length
-                    prot,                       // prot
+                    0,                           // addr  = NULL → kernel chooses
+                    map_len,                     // length
+                    prot,                        // prot
                     MAP_PRIVATE | MAP_ANONYMOUS, // flags
-                    usize::MAX,                 // fd = -1  (usize::MAX == -1 as usize)
-                    0,                          // offset = 0
-                ))?
+                    usize::MAX,                  // fd = -1  (usize::MAX == -1 as usize)
+                    0,                           // offset = 0
+                ))? as usize
             };
             Ok(MmapInner {
                 ptr: ptr as *mut u8,
@@ -113,10 +114,9 @@ mod imp {
             (base, map_len)
         }
 
-        fn mprotect(&mut self, prot: usize) -> Result<(), i32> {
+        fn mprotect(&mut self, prot: usize) -> Result<isize, i32> {
             let (base, map_len) = self.mmap_base_and_len();
             check(unsafe { syscall3(SYS_MPROTECT, base as usize, map_len, prot) })
-                .map(|_| ())
         }
 
         #[inline]
