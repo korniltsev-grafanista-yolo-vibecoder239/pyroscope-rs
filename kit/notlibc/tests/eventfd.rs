@@ -1,11 +1,11 @@
-//! Integration tests for `sig_safety::eventfd`.
+//! Integration tests for `notlibc::eventfd`.
 //!
 //! libc is used only in the test harness for draining fds and verifying
 //! counts; production code uses no libc.
 
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use sig_safety::eventfd::{EventFd, EventSet, EVENT_SET_CAPACITY};
+use notlibc::eventfd::{EventFd, EventSet, EVENT_SET_CAPACITY};
 use std::sync::Arc;
 use std::thread;
 
@@ -146,15 +146,30 @@ fn event_set_all_16_threads_notify_wait_sees_at_least_one() {
 
 #[test]
 fn drop_closes_fd() {
-    let fd = {
-        let efd = EventFd::new().expect("EventFd::new");
-        efd.as_fd()
-    };
-    // After drop the fd must be invalid.
-    let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    assert_eq!(ret, -1, "fcntl should fail on a closed fd");
-    let errno = unsafe { *libc::__errno_location() };
-    assert_eq!(errno, libc::EBADF, "expected EBADF, got errno {errno}");
+    // Strategy: record the /proc/self/fd/<N> symlink target before drop
+    // (it points to "anon_inode:[eventfd]").  After drop the symlink must
+    // either be gone or point to something different.  A parallel test that
+    // reuses the same fd number will point to a different inode type, so
+    // either outcome proves that Drop closed the original fd.
+    let efd = EventFd::new().expect("EventFd::new");
+    let fd = efd.as_fd();
+    let proc_path = format!("/proc/self/fd/{fd}");
+
+    let target_before = std::fs::read_link(&proc_path)
+        .expect("fd must be visible in /proc/self/fd before drop");
+
+    drop(efd);
+
+    // After drop: either the link is gone, or it points somewhere else.
+    match std::fs::read_link(&proc_path) {
+        Err(_) => { /* fd gone — pass */ }
+        Ok(target_after) => {
+            assert_ne!(
+                target_after, target_before,
+                "fd {fd} still points to the same eventfd after drop"
+            );
+        }
+    }
 }
 
 /// Global slot written by the SIGPROF handler.
