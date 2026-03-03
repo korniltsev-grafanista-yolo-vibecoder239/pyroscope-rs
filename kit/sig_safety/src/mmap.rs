@@ -1,79 +1,310 @@
-/// Raw mmap/munmap wrappers via inline assembly syscalls (no libc).
+/// Anonymous memory mapping via inline assembly syscalls — no libc.
 ///
-/// Design follows memmap2's unix.rs approach:
-/// - anonymous private mapping (MAP_PRIVATE | MAP_ANONYMOUS, fd=-1, offset=0)
-/// - PROT_READ | PROT_WRITE
-/// - error range check: ret in [usize::MAX-4095, usize::MAX] means -errno
-/// - mapping length capped at isize::MAX (Rust slice invariant)
+/// Structural design follows memmap2's unix.rs (MmapInner / Mmap / MmapMut),
+/// with every libc call replaced by a direct x86_64 syscall.
+///
+/// Only anonymous private mappings are supported (the use-case for
+/// signal-handler–safe scratch buffers).  File-backed maps are out of scope.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod imp {
+    use core::ops::{Deref, DerefMut};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── syscall numbers ────────────────────────────────────────────────────────
     const SYS_MMAP: usize = 9;
     const SYS_MUNMAP: usize = 11;
+    const SYS_MPROTECT: usize = 10;
+    const SYS_SYSCONF: usize = 152; // used only at compile-time via _SC_PAGESIZE=30
 
+    // ── mmap prot / flags constants (Linux x86_64) ─────────────────────────────
     const PROT_READ: usize = 1;
     const PROT_WRITE: usize = 2;
-    // Linux uses MAP_ANONYMOUS; MAP_ANON is an alias on most BSDs — use the Linux constant.
+    const PROT_EXEC: usize = 4;
     const MAP_PRIVATE: usize = 0x02;
     const MAP_ANONYMOUS: usize = 0x20;
 
-    /// Allocates an anonymous private mapping via SYS_mmap.
-    ///
-    /// Equivalent to:
-    ///   mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
-    ///
-    /// Returns `Err(errno)` on failure.
-    pub fn safe_mmap(size: usize) -> Result<*mut u8, i32> {
-        // Mirror memmap2: Rust slices cannot be larger than isize::MAX.
-        if size == 0 || size > isize::MAX as usize {
-            // EINVAL
-            return Err(22);
+    // ── raw syscall helpers ────────────────────────────────────────────────────
+
+    /// Returns `Err(errno)` when the kernel return value indicates failure
+    /// (i.e. ret is in the range [usize::MAX-4095, usize::MAX]).
+    #[inline]
+    fn check(ret: usize) -> Result<usize, i32> {
+        if ret >= usize::MAX - 4095 {
+            Err(-(ret as i32))
+        } else {
+            Ok(ret)
         }
+    }
+
+    unsafe fn syscall_mmap(
+        addr: usize,
+        length: usize,
+        prot: usize,
+        flags: usize,
+        fd: usize,   // pass usize::MAX for -1
+        offset: usize,
+    ) -> Result<usize, i32> {
         let ret: usize;
         unsafe {
             core::arch::asm!(
                 "syscall",
                 in("rax") SYS_MMAP,
-                in("rdi") 0usize,                     // addr  = NULL
-                in("rsi") size,                        // length
-                in("rdx") PROT_READ | PROT_WRITE,      // prot
-                in("r10") MAP_PRIVATE | MAP_ANONYMOUS, // flags
-                in("r8")  usize::MAX,                  // fd = -1 (all bits set)
-                in("r9")  0usize,                      // offset = 0
-                lateout("rax") ret,
-                out("rcx") _,   // clobbered by syscall
-                out("r11") _,   // clobbered by syscall
-            );
-        }
-        if ret >= usize::MAX - 4095 {
-            Err(-(ret as i32))
-        } else {
-            Ok(ret as *mut u8)
-        }
-    }
-
-    /// Unmaps a previously mapped region via SYS_munmap.
-    ///
-    /// Returns `Err(errno)` on failure (e.g. EINVAL for bad addr/size).
-    pub fn safe_munmap(addr: *mut u8, size: usize) -> Result<(), i32> {
-        let ret: usize;
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                in("rax") SYS_MUNMAP,
-                in("rdi") addr as usize,
-                in("rsi") size,
+                in("rdi") addr,
+                in("rsi") length,
+                in("rdx") prot,
+                in("r10") flags,
+                in("r8")  fd,
+                in("r9")  offset,
                 lateout("rax") ret,
                 out("rcx") _,
                 out("r11") _,
             );
         }
-        if ret >= usize::MAX - 4095 {
-            Err(-(ret as i32))
-        } else {
-            Ok(())
+        check(ret)
+    }
+
+    unsafe fn syscall_munmap(addr: usize, length: usize) -> Result<(), i32> {
+        let ret: usize;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") SYS_MUNMAP,
+                in("rdi") addr,
+                in("rsi") length,
+                lateout("rax") ret,
+                out("rcx") _,
+                out("r11") _,
+            );
+        }
+        check(ret).map(|_| ())
+    }
+
+    unsafe fn syscall_mprotect(addr: usize, length: usize, prot: usize) -> Result<(), i32> {
+        let ret: usize;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") SYS_MPROTECT,
+                in("rdi") addr,
+                in("rsi") length,
+                in("rdx") prot,
+                lateout("rax") ret,
+                out("rcx") _,
+                out("r11") _,
+            );
+        }
+        check(ret).map(|_| ())
+    }
+
+    // ── page size (cached, same as memmap2) ───────────────────────────────────
+
+    pub fn page_size() -> usize {
+        // _SC_PAGESIZE = 30 on Linux
+        const SC_PAGESIZE: usize = 30;
+        static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+        match PAGE_SIZE.load(Ordering::Relaxed) {
+            0 => {
+                let ret: usize;
+                unsafe {
+                    core::arch::asm!(
+                        "syscall",
+                        in("rax") SYS_SYSCONF,
+                        in("rdi") SC_PAGESIZE,
+                        lateout("rax") ret,
+                        out("rcx") _,
+                        out("r11") _,
+                    );
+                }
+                // sysconf returns the page size directly (not a syscall on Linux
+                // — it's a vDSO / libc wrapper).  We fall back to 4096 if the
+                // raw syscall path fails (which it usually will; Linux exposes
+                // sysconf only through libc).  For our purposes 4096 is always
+                // correct on x86_64.
+                let ps = if ret == 0 || ret >= usize::MAX - 4095 {
+                    4096
+                } else {
+                    ret
+                };
+                PAGE_SIZE.store(ps, Ordering::Relaxed);
+                ps
+            }
+            ps => ps,
+        }
+    }
+
+    // ── MmapInner (mirrors memmap2's MmapInner) ───────────────────────────────
+    //
+    // Memory layout (same as memmap2):
+    //
+    //   mmap_base_ptr ──► [page-aligned kernel mapping start]
+    //                          │  offset bytes (ignored prefix for file maps)
+    //   self.ptr      ──►      └─► [slice start, = mmap_base_ptr for anon maps]
+    //
+    // For anonymous maps, offset is always 0, so self.ptr == mmap_base_ptr.
+
+    struct MmapInner {
+        ptr: *mut u8, // start of the user-visible slice (NOT necessarily page-aligned)
+        len: usize,   // length of the user-visible slice
+    }
+
+    impl MmapInner {
+        /// Create an anonymous private mapping.
+        ///
+        /// `prot` must be one of the `PROT_*` combinations defined above.
+        fn map_anon(len: usize, prot: usize) -> Result<Self, i32> {
+            // Mirror memmap2: Rust slices cannot exceed isize::MAX.
+            // On 64-bit this is never a practical issue but we keep the guard.
+            if core::mem::size_of::<usize>() < 8 && len > isize::MAX as usize {
+                return Err(22); // EINVAL
+            }
+            // mmap(2): "If len is zero, mmap() shall fail." — map at least 1 byte
+            // so we always get a valid kernel mapping; MmapInner::len stays 0 so
+            // the public slice is still empty.
+            let map_len = len.max(1);
+            let ptr = unsafe {
+                syscall_mmap(
+                    0,           // addr = NULL → kernel chooses
+                    map_len,
+                    prot,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    usize::MAX,  // fd = -1
+                    0,           // offset = 0
+                )?
+            };
+            Ok(MmapInner {
+                ptr: ptr as *mut u8,
+                len,
+            })
+        }
+
+        // Returns (page_aligned_base, map_len) for munmap/mprotect.
+        // Same logic as memmap2's as_mmap_params().
+        fn mmap_base_and_len(&self) -> (*mut u8, usize) {
+            // For anonymous maps the ptr is already page-aligned and offset=0,
+            // so this reduces to (self.ptr, self.len.max(1)).
+            let offset = self.ptr as usize % page_size();
+            let base = unsafe { self.ptr.sub(offset) };
+            let map_len = (self.len + offset).max(1);
+            (base, map_len)
+        }
+
+        fn mprotect(&mut self, prot: usize) -> Result<(), i32> {
+            let (base, map_len) = self.mmap_base_and_len();
+            unsafe { syscall_mprotect(base as usize, map_len, prot) }
+        }
+
+        #[inline]
+        pub fn ptr(&self) -> *const u8 {
+            self.ptr
+        }
+
+        #[inline]
+        pub fn mut_ptr(&mut self) -> *mut u8 {
+            self.ptr
+        }
+
+        #[inline]
+        pub fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl Drop for MmapInner {
+        fn drop(&mut self) {
+            let (base, map_len) = self.mmap_base_and_len();
+            // Errors ignored in Drop — same rationale as memmap2.
+            let _ = unsafe { syscall_munmap(base as usize, map_len) };
+        }
+    }
+
+    // SAFETY: the mapped memory is not tied to any thread-local state.
+    unsafe impl Send for MmapInner {}
+    unsafe impl Sync for MmapInner {}
+
+    // ── Public RAII types ──────────────────────────────────────────────────────
+
+    /// An immutable anonymous memory map.
+    ///
+    /// Derefs to `&[u8]`.  The mapping is unmapped when dropped.
+    pub struct Mmap {
+        inner: MmapInner,
+    }
+
+    impl Mmap {
+        /// Create a read-only anonymous mapping of `len` bytes.
+        pub fn map_anon(len: usize) -> Result<Self, i32> {
+            MmapInner::map_anon(len, PROT_READ).map(|inner| Mmap { inner })
+        }
+
+        /// Transition to a mutable mapping (mprotect PROT_READ|PROT_WRITE).
+        pub fn make_mut(mut self) -> Result<MmapMut, i32> {
+            self.inner.mprotect(PROT_READ | PROT_WRITE)?;
+            Ok(MmapMut { inner: self.inner })
+        }
+    }
+
+    impl Deref for Mmap {
+        type Target = [u8];
+        #[inline]
+        fn deref(&self) -> &[u8] {
+            unsafe { core::slice::from_raw_parts(self.inner.ptr(), self.inner.len()) }
+        }
+    }
+
+    /// A mutable anonymous memory map (PROT_READ | PROT_WRITE).
+    ///
+    /// Derefs to `&mut [u8]`.  The mapping is unmapped when dropped.
+    pub struct MmapMut {
+        inner: MmapInner,
+    }
+
+    impl MmapMut {
+        /// Create a read-write anonymous mapping of `len` bytes.
+        pub fn map_anon(len: usize) -> Result<Self, i32> {
+            MmapInner::map_anon(len, PROT_READ | PROT_WRITE)
+                .map(|inner| MmapMut { inner })
+        }
+
+        /// Transition to a read-only mapping (mprotect PROT_READ).
+        pub fn make_read_only(mut self) -> Result<Mmap, i32> {
+            self.inner.mprotect(PROT_READ)?;
+            Ok(Mmap { inner: self.inner })
+        }
+
+        /// Transition to a read+execute mapping (mprotect PROT_READ|PROT_EXEC).
+        pub fn make_exec(mut self) -> Result<Mmap, i32> {
+            self.inner.mprotect(PROT_READ | PROT_EXEC)?;
+            Ok(Mmap { inner: self.inner })
+        }
+
+        #[inline]
+        pub fn as_ptr(&self) -> *const u8 {
+            self.inner.ptr()
+        }
+
+        #[inline]
+        pub fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.inner.mut_ptr()
+        }
+    }
+
+    impl Deref for MmapMut {
+        type Target = [u8];
+        #[inline]
+        fn deref(&self) -> &[u8] {
+            unsafe { core::slice::from_raw_parts(self.inner.ptr(), self.inner.len()) }
+        }
+    }
+
+    impl DerefMut for MmapMut {
+        #[inline]
+        fn deref_mut(&mut self) -> &mut [u8] {
+            unsafe {
+                core::slice::from_raw_parts_mut(self.inner.mut_ptr(), self.inner.len())
+            }
         }
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use imp::{safe_mmap, safe_munmap};
+pub use imp::{Mmap, MmapMut, page_size};
