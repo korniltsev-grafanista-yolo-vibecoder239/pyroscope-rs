@@ -24,6 +24,7 @@ members = [
     "pyroscope_ffi/python/rust",
     "kit/kindasafe",
     "kit/pprof_enc",
+    "kit/sig_safety",
 ]
 
 [workspace.dependencies]
