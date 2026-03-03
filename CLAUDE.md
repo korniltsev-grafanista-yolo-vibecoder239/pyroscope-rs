@@ -12,6 +12,18 @@ We are currently working on a new profiler implementation. The design document i
 
 Use the Vibe Kanban MCP server for all issue tracking. Do **not** use markdown files or git for task management.
 
+Rules:
+- **Only create issues** — never create workspaces
+- **Never change issue status** — status is managed by the user, not agents
+- If an issue depends on another and must not be started until the blocker is done, use `create_issue_relationship` with type `blocking` to link them
+
+Key tools:
+- `list_issues` — view current issues
+- `create_issue` — create a new issue
+- `update_issue` — update an issue's title or description (not status)
+- `get_issue` — get details on a specific issue
+- `create_issue_relationship` — link issues (e.g. blocker → blocked)
+
 # Build & Packaging
 
 When adding new workspace crates or source directories needed for Rust compilation, update ALL of these:
