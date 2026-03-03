@@ -1,6 +1,6 @@
 # pyroscope-rs
 
-We are currently working on a new profiler implementation. The design document is in the adjacent `pyroscope-rs-design-docs/` folder (`design.md`).
+We are currently working on a new profiler implementation. The design document is in `vibekanban-current/design.md`.
 
 ## Contribution Workflow
 
