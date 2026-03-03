@@ -6,7 +6,6 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 use notlibc::eventfd::{EventFd, EventSet, EVENT_SET_CAPACITY};
-use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::thread;
 
@@ -147,63 +146,55 @@ fn event_set_all_16_threads_notify_wait_sees_at_least_one() {
 
 #[test]
 fn drop_closes_fd() {
-    // Use inode identity to distinguish "same fd reused" from "drop did not
-    // close": each open file description has a unique inode in /proc/self/fd/.
-    // Two separate EventFd::new() calls produce different inodes even if the
-    // kernel recycles the same fd number.
+    // Pin a duplicate of the eventfd at a high slot (fd 498) so the kernel
+    // cannot recycle the original low fd number while we are checking it.
+    // After Drop closes the low fd we verify it with fcntl(F_GETFD).
     let efd = EventFd::new().expect("EventFd::new");
     let fd = efd.as_fd();
-    let proc_path = format!("/proc/self/fd/{fd}");
 
-    let ino_before = std::fs::metadata(&proc_path)
-        .expect("fd must be visible in /proc/self/fd before drop")
-        .ino();
-    println!("drop_closes_fd: fd={fd} inode_before={ino_before}");
+    let dup_slot: libc::c_int = 498;
+    let dup_ret = unsafe { libc::dup2(fd, dup_slot) };
+    assert_eq!(dup_ret, dup_slot, "dup2 to slot {dup_slot} failed");
+    println!("drop_closes_fd: fd={fd} pinned at fd={dup_slot}");
 
-    drop(efd);
+    drop(efd); // closes fd
 
-    // After drop: either the link is gone (fd not reused yet), or it points
-    // to a different file description (different inode → drop did close it).
-    match std::fs::metadata(&proc_path) {
-        Err(e) => { println!("drop_closes_fd: fd={fd} after=<gone> ({e})"); /* pass */ }
-        Ok(meta_after) => {
-            let ino_after = meta_after.ino();
-            println!("drop_closes_fd: fd={fd} inode_after={ino_after}");
-            assert_ne!(
-                ino_after, ino_before,
-                "fd {fd} still has the same inode {ino_before} after drop — Drop did not close it"
-            );
-        }
-    }
+    // fd must now be closed; dup_slot still holds a live reference.
+    let fcntl_ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    let errno = unsafe { *libc::__errno_location() };
+    println!("drop_closes_fd: fcntl({fd}, F_GETFD)={fcntl_ret} errno={errno}");
+
+    // Clean up before asserting.
+    unsafe { libc::close(dup_slot) };
+
+    assert_eq!(fcntl_ret, -1, "fcntl should fail on a closed fd");
+    assert_eq!(errno, libc::EBADF, "expected EBADF, got errno {errno}");
 }
 
-/// Pointer to the `EventFd` that the SIGPROF handler should call `notify()` on.
-///
-/// Set before raising SIGPROF, cleared immediately after.  The pointee must
-/// outlive the signal handler invocation; we guarantee that because the
-/// `EventFd` is alive on the test thread's stack throughout.
+/// Raw pointer obtained from `Arc::into_raw()` — the signal handler borrows
+/// it without touching the refcount (no allocation in async-signal context).
+/// The test thread retains ownership and calls `Arc::from_raw` to reclaim it.
 static SIGNAL_EFD: std::sync::atomic::AtomicPtr<EventFd> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn sigprof_handler(_sig: libc::c_int) {
     let ptr = SIGNAL_EFD.load(std::sync::atomic::Ordering::Relaxed);
     if !ptr.is_null() {
-        // SAFETY: the test guarantees `ptr` is valid for the duration of the
-        // signal handler.  `EventFd::notify()` is async-signal-safe: it uses
-        // a direct inline-asm SYS_write syscall with no heap or locking.
+        // SAFETY: `ptr` came from `Arc::into_raw()`; the Arc is kept alive by
+        // the test thread for the entire duration of the signal handler.
+        // `notify()` is async-signal-safe (direct inline-asm SYS_write).
         unsafe { (*ptr).notify() };
     }
 }
 
 #[test]
 fn notify_from_signal_handler() {
-    let efd = EventFd::new().expect("EventFd::new");
+    let efd = Arc::new(EventFd::new().expect("EventFd::new"));
 
-    // Make the EventFd reachable from the signal handler.
-    SIGNAL_EFD.store(
-        &efd as *const EventFd as *mut EventFd,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // Leak a strong reference into the static so the handler can reach it.
+    // We reclaim it with Arc::from_raw after the signal returns.
+    let raw = Arc::into_raw(Arc::clone(&efd));
+    SIGNAL_EFD.store(raw as *mut EventFd, std::sync::atomic::Ordering::Relaxed);
 
     // Install SIGPROF handler.
     let sa = libc::sigaction {
@@ -219,13 +210,15 @@ fn notify_from_signal_handler() {
     // Fire the signal synchronously; the handler calls efd.notify().
     unsafe { libc::raise(libc::SIGPROF) };
 
+    // Restore the previous handler, clear the static, and reclaim the Arc.
+    unsafe { libc::sigaction(libc::SIGPROF, &old_sa, std::ptr::null_mut()) };
+    SIGNAL_EFD.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `raw` came from Arc::into_raw above; no other owner remains.
+    drop(unsafe { Arc::from_raw(raw) });
+
     // Drain the fd — must see exactly 1.
     let count = drain_one(efd.as_fd());
     assert_eq!(count, 1, "expected 1 notification from signal handler, got {count}");
-
-    // Restore the previous handler and clear the global pointer.
-    unsafe { libc::sigaction(libc::SIGPROF, &old_sa, std::ptr::null_mut()) };
-    SIGNAL_EFD.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
 }
 
 #[test]
@@ -395,30 +388,31 @@ fn event_set_add_same_fd_twice_returns_eexist() {
 
 #[test]
 fn event_set_drop_closes_epoll_fd() {
-    // Same inode-based strategy as drop_closes_fd: each epoll instance has a
-    // unique inode in /proc/self/fd/, so recycling the fd number for a new
-    // epoll instance produces a different inode — distinguishable from a
-    // failure to close.
+    // Pin a duplicate of the epoll fd at a high slot (fd 499) so the kernel
+    // cannot recycle the *original* low fd number for any other descriptor
+    // while we are checking it.  After Drop closes the low fd we verify it
+    // with fcntl(F_GETFD), then clean up the high-slot dup ourselves.
     let set = EventSet::new().unwrap();
     let epfd = set.epoll_fd();
-    let proc_path = format!("/proc/self/fd/{epfd}");
 
-    let ino_before = std::fs::metadata(&proc_path)
-        .expect("epoll fd must be visible in /proc/self/fd before drop")
-        .ino();
-    println!("event_set_drop_closes_epoll_fd: epfd={epfd} inode_before={ino_before}");
+    // dup2(epfd, 499): closes whatever was at 499 and puts our epoll there.
+    let dup_slot: libc::c_int = 499;
+    let dup_ret = unsafe { libc::dup2(epfd, dup_slot) };
+    assert_eq!(dup_ret, dup_slot, "dup2 to slot {dup_slot} failed");
+    println!("event_set_drop_closes_epoll_fd: epfd={epfd} pinned at fd={dup_slot}");
 
-    drop(set);
+    drop(set); // closes epfd
 
-    match std::fs::metadata(&proc_path) {
-        Err(e) => { println!("event_set_drop_closes_epoll_fd: epfd={epfd} after=<gone> ({e})"); /* pass */ }
-        Ok(meta_after) => {
-            let ino_after = meta_after.ino();
-            println!("event_set_drop_closes_epoll_fd: epfd={epfd} inode_after={ino_after}");
-            assert_ne!(
-                ino_after, ino_before,
-                "epoll fd {epfd} still has inode {ino_before} after drop — Drop did not close it"
-            );
-        }
-    }
+    // epfd must now be closed; dup_slot still holds a live reference.
+    let fcntl_ret = unsafe { libc::fcntl(epfd, libc::F_GETFD) };
+    let errno = unsafe { *libc::__errno_location() };
+    println!(
+        "event_set_drop_closes_epoll_fd: fcntl({epfd}, F_GETFD)={fcntl_ret} errno={errno}"
+    );
+
+    // Clean up the high-slot dup before asserting so we don't leak it.
+    unsafe { libc::close(dup_slot) };
+
+    assert_eq!(fcntl_ret, -1, "fcntl should fail on a closed epoll fd");
+    assert_eq!(errno, libc::EBADF, "expected EBADF, got errno {errno}");
 }
