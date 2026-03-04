@@ -37,11 +37,10 @@ mod linux {
 
         let version_u32 = (raw & 0xFFFF_FFFF) as u32;
         let major = (version_u32 >> 24) & 0xFF;
+        let minor = (version_u32 >> 16) & 0xFF;
 
-        assert_eq!(
-            major, 3,
-            "Py_Version major must be 3, got {major} (raw=0x{raw:016x})"
-        );
+        assert_eq!(major, 3, "Py_Version major must be 3 (raw=0x{raw:016x})");
+        assert_eq!(minor, 14, "Py_Version minor must be 14 (raw=0x{raw:016x})");
 
         Ok(())
     }
