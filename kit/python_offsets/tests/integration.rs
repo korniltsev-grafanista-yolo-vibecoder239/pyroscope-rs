@@ -30,7 +30,8 @@ mod linux {
                 }
             }
         );
-        let _guard = DlopenGuard(handle);
+        // Intentionally leak the handle: the test process is short-lived, and
+        // calling dlclose would run libpython3's destructors which can SIGSEGV.
 
         // Initialize kindasafe after dlopen so its SIGSEGV handler is in place
         // before the safe memory reads below.
@@ -75,17 +76,5 @@ mod linux {
         );
 
         Ok(())
-    }
-
-    /// RAII guard that calls `dlclose` on drop, ensuring the handle is released
-    /// even when the test fails or returns early via `?`.
-    struct DlopenGuard(*mut libc::c_void);
-
-    impl Drop for DlopenGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { libc::dlclose(self.0) };
-            }
-        }
     }
 }
