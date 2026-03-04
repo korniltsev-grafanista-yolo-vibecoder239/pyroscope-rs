@@ -8,10 +8,11 @@ mod linux {
 
     #[test]
     fn end_to_end_python_offsets() -> Result<()> {
-        // RTLD_NODELETE keeps the library resident so that the handle can be
-        // dropped (leaked) without dlclose unloading it and running its FINI
-        // destructors. Calling dlclose on libpython3 while the kindasafe signal
-        // handler is installed crashed the test process in practice.
+        kindasafe_init::init().map_err(|e| anyhow!("kindasafe_init::init failed: {e:?}"))?;
+
+        // RTLD_NODELETE keeps the library resident so dlclose doesn't run the
+        // FINI destructors. The handle is intentionally leaked (not dlclosed)
+        // since the test process is short-lived.
         let path_cstr =
             CString::new(LIBPYTHON_PATH).map_err(|e| anyhow!("CString::new failed: {e}"))?;
         let handle =
@@ -28,9 +29,6 @@ mod linux {
                 }
             }
         );
-        // Initialize kindasafe after dlopen so its SIGSEGV handler is in place
-        // before the safe memory reads below.
-        kindasafe_init::init().map_err(|e| anyhow!("kindasafe_init::init failed: {e:?}"))?;
 
         // Step 1: locate the loaded Python binary in /proc/self/maps.
         let binary = python_offsets::find_python_in_maps()
