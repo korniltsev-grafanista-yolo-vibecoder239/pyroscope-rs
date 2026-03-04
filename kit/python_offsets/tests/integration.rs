@@ -8,16 +8,10 @@ mod linux {
 
     #[test]
     fn end_to_end_python_offsets() -> Result<()> {
-        // dlopen before kindasafe_init: libpython3's constructor (and later its
-        // destructors) can raise SIGSEGV internally. The kindasafe handler only
-        // recovers SIGSEGVs that originate at its own crash-point PCs; any other
-        // faulting address causes it to chain to the previous handler, which
-        // would be SIG_DFL at that point and kill the process.
-        //
-        // Running dlopen before init() means the constructors execute with the
-        // default handler still in place (where the kernel's normal SIGSEGV
-        // recovery path applies). RTLD_NODELETE keeps the library pinned so
-        // dlclose skips the destructors entirely.
+        // RTLD_NODELETE keeps the library resident so that the handle can be
+        // dropped (leaked) without dlclose unloading it and running its FINI
+        // destructors. Calling dlclose on libpython3 while the kindasafe signal
+        // handler is installed crashed the test process in practice.
         let path_cstr =
             CString::new(LIBPYTHON_PATH).map_err(|e| anyhow!("CString::new failed: {e}"))?;
         let handle =
@@ -34,9 +28,6 @@ mod linux {
                 }
             }
         );
-        // Intentionally leak the handle: the test process is short-lived, and
-        // calling dlclose would run libpython3's destructors which can SIGSEGV.
-
         // Initialize kindasafe after dlopen so its SIGSEGV handler is in place
         // before the safe memory reads below.
         kindasafe_init::init().map_err(|e| anyhow!("kindasafe_init::init failed: {e:?}"))?;
