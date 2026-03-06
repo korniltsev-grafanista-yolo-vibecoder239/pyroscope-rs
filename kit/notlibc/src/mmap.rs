@@ -1,10 +1,10 @@
-/// Anonymous memory mapping via inline assembly syscalls — no libc.
-///
-/// Structural design follows memmap2's unix.rs (MmapInner / Mmap / MmapMut),
-/// with every libc call replaced by a call into `crate::syscall`.
-///
-/// Only anonymous private mappings are supported (the use-case for
-/// signal-handler–safe scratch buffers).  File-backed maps are out of scope.
+//! Anonymous memory mapping via inline assembly syscalls — no libc.
+//!
+//! Structural design follows memmap2's unix.rs (MmapInner / Mmap / MmapMut),
+//! with every libc call replaced by a call into `crate::syscall`.
+//!
+//! Only anonymous private mappings are supported (the use-case for
+//! signal-handler–safe scratch buffers).  File-backed maps are out of scope.
 
 /// Convert a raw kernel `isize` return value into `Result`.
 /// Negative values encode `-errno`; non-negative values are success.
@@ -23,11 +23,7 @@ mod imp {
     use super::check;
     use crate::auxv::getauxval;
     use crate::syscall::{syscall2, syscall3, syscall6};
-
-    // ── syscall numbers ────────────────────────────────────────────────────────
-    const SYS_MMAP: usize = 9;
-    const SYS_MUNMAP: usize = 11;
-    const SYS_MPROTECT: usize = 10;
+    use crate::syscall_nr::x86_64::{SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP};
 
     // ── mmap prot / flags constants (Linux x86_64) ─────────────────────────────
     const PROT_READ: usize = 1;

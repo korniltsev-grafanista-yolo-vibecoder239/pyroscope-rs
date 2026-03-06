@@ -1,17 +1,13 @@
-/// Read entries from the ELF auxiliary vector via `/proc/self/auxv`.
-///
-/// Uses only inline-assembly syscalls (SYS_openat, SYS_read, SYS_close) so
-/// it is safe to call from a signal handler and requires no libc.
+//! Read entries from the ELF auxiliary vector via `/proc/self/auxv`.
+//!
+//! Uses only inline-assembly syscalls (SYS_openat, SYS_read, SYS_close) so
+//! it is safe to call from a signal handler and requires no libc.
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod imp {
     use crate::mmap::check;
     use crate::syscall::{syscall1, syscall3, syscall4};
-
-    // ── syscall numbers ────────────────────────────────────────────────────────
-    const SYS_OPENAT: usize = 257;
-    const SYS_READ: usize = 0;
-    const SYS_CLOSE: usize = 3;
+    use crate::syscall_nr::x86_64::{SYS_CLOSE, SYS_OPENAT, SYS_READ};
 
     // ── openat constants ───────────────────────────────────────────────────────
     const AT_FDCWD: usize = (-100_isize) as usize;
