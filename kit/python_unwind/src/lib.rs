@@ -84,16 +84,6 @@ pub fn unwind(tstate: u64, offsets: &py313::_Py_DebugOffsets, buf: &mut [RawFram
             instr_offset: instr_ptr,
         };
 
-        notlibc::debug::writes("  [");
-        notlibc::debug::write_hex(depth);
-        notlibc::debug::writes("] code=0x");
-        notlibc::debug::write_hex(code_obj as usize);
-        notlibc::debug::writes(" instr=0x");
-        notlibc::debug::write_hex(instr_ptr as usize);
-        notlibc::debug::writes(" owner=");
-        notlibc::debug::write_hex(owner as usize);
-        notlibc::debug::puts("");
-
         depth += 1;
 
         prev_frame = frame_ptr;
@@ -102,10 +92,6 @@ pub fn unwind(tstate: u64, offsets: &py313::_Py_DebugOffsets, buf: &mut [RawFram
             Err(_) => break,
         };
     }
-
-    notlibc::debug::writes("python_unwind: depth=");
-    notlibc::debug::write_hex(depth);
-    notlibc::debug::puts("");
 
     depth
 }
