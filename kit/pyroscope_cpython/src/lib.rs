@@ -1,3 +1,4 @@
+use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
@@ -15,55 +16,33 @@ const DEFAULT_NUM_SHARDS: usize = 16;
 static LIFECYCLE: AtomicU32 = AtomicU32::new(STATE_UNINITIALIZED);
 
 /// Whether to log diagnostic messages to stderr. Off by default.
-/// Set via `pyroscope_configure` before calling `pyroscope_start`.
 static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Write a message to stderr when logging is enabled.
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        if LOG_ENABLED.load(Ordering::Relaxed) {
-            eprintln!("pyroscope_cpython: {}", format_args!($($arg)*));
-        }
-    };
-}
+// ── Error codes ──────────────────────────────────────────────────────────────
 
-/// Write an error message to stderr when logging is enabled.
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        if LOG_ENABLED.load(Ordering::Relaxed) {
-            eprintln!("pyroscope_cpython ERROR: {}", format_args!($($arg)*));
-        }
-    };
-}
+const ERR_KINDASAFE_INIT: c_int = 1;
+const ERR_PYTHON_NOT_FOUND: c_int = 2;
+const ERR_SYMBOL_NOT_FOUND: c_int = 3;
+const ERR_DEBUG_OFFSETS_MISMATCH: c_int = 4;
+const ERR_UNSUPPORTED_VERSION: c_int = 5;
+const ERR_TLS_DISCOVERY_FAILED: c_int = 6;
+const ERR_ALLOC_FAILED: c_int = 7;
+const ERR_SIGNAL_HANDLER: c_int = 8;
+const ERR_ALREADY_RUNNING: c_int = 9;
 
-// ── Configuration ────────────────────────────────────────────────────────────
+// ── Logging ──────────────────────────────────────────────────────────────────
 
-/// Runtime configuration for the profiler.
-///
-/// All fields have reasonable defaults matching the original hardcoded values.
-/// Call `pyroscope_configure` before `pyroscope_start` to override.
-struct Config {
-    /// Number of shards for concurrent signal handler access (default: 16).
-    num_shards: usize,
-    /// Notify the reader thread every N successful sample writes (default: 32).
-    notify_interval: u32,
-    /// Enable diagnostic logging to stderr (default: false).
-    log_enabled: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            num_shards: DEFAULT_NUM_SHARDS,
-            notify_interval: sig_ring::DEFAULT_NOTIFY_INTERVAL,
-            log_enabled: false,
-        }
+fn log_info(msg: &str) {
+    if LOG_ENABLED.load(Ordering::Relaxed) {
+        eprintln!("pyroscope_cpython: {}", msg);
     }
 }
 
-/// Global config, set before start. Protected by LIFECYCLE state machine:
-/// only written when STATE_UNINITIALIZED, only read during init_sequence.
-static CONFIG: std::sync::Mutex<Option<Config>> = std::sync::Mutex::new(None);
+fn log_error(msg: &str) {
+    if LOG_ENABLED.load(Ordering::Relaxed) {
+        eprintln!("pyroscope_cpython ERROR: {}", msg);
+    }
+}
 
 // ── Per-shard state ──────────────────────────────────────────────────────────
 
@@ -76,7 +55,7 @@ struct Shard {
     producer: FrameProducer<'static, RING_SIZE>,
 }
 
-// ── Handler state (shared between init + signal handler) ─────────────────────
+// ── Handler state (shared between init + signal handler + reader) ────────────
 
 /// Global profiler state accessed by the signal handler via `AtomicPtr`.
 ///
@@ -87,11 +66,14 @@ struct HandlerState {
     tls_offset: u64,
     /// Expected type-object addresses for runtime type checking.
     type_addrs: python_unwind::TypeAddrs,
-    /// Dynamically-sized shard array (length = config.num_shards).
+    /// Dynamically-sized shard array (length = num_shards).
     shards: Vec<notlibc::ShardMutex<Shard>>,
+    /// Per-shard bbqueue consumers. Only accessed by the reader thread.
+    /// Wrapped in UnsafeCell for interior mutability; safety is guaranteed
+    /// by the single-reader-thread invariant.
+    consumers: Vec<UnsafeCell<FrameConsumer<'static, RING_SIZE>>>,
     eventfd: notlibc::EventFd,
     samples_since_notify: AtomicU32,
-    /// Cached config values used in the signal handler hot path.
     num_shards: usize,
     notify_interval: u32,
 }
@@ -178,33 +160,36 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
 
 /// Reader thread entry point. Wakes on eventfd or 15s timeout, drains all
 /// shard consumers, and debug-prints the received stacks.
-fn reader_thread(
-    state: &'static HandlerState,
-    mut consumers: Vec<FrameConsumer<'static, RING_SIZE>>,
-) {
+fn reader_thread(state: &'static HandlerState) {
     // Set up epoll to wait on the eventfd.
     let mut event_set = match notlibc::EventSet::new() {
         Ok(es) => es,
         Err(_) => {
-            log_error!("reader: failed to create EventSet");
+            log_error("reader: failed to create EventSet");
             return;
         }
     };
     if event_set.add(&state.eventfd).is_err() {
-        log_error!("reader: failed to add eventfd to EventSet");
+        log_error("reader: failed to add eventfd to EventSet");
         return;
     }
 
-    log_info!("reader thread started, {} shards", consumers.len());
+    log_info(&format!(
+        "reader thread started, {} shards",
+        state.num_shards
+    ));
 
     loop {
         // Wait for eventfd notification or 15s timeout.
         let _ = event_set.wait(15_000);
 
         // Drain all shards.
-        for (shard_idx, consumer) in consumers.iter_mut().enumerate() {
+        for shard_idx in 0..state.num_shards {
             // Lock the shard to ensure no signal handler is mid-write.
-            let _guard = state.shards[shard_idx].lock();
+            let _shard_guard = state.shards[shard_idx].lock();
+
+            // SAFETY: consumers are only accessed by the reader thread.
+            let consumer = unsafe { &mut *state.consumers[shard_idx].get() };
 
             // Drain all available frames from this shard's consumer.
             while let Some(grant) = consumer.read() {
@@ -235,57 +220,6 @@ fn reader_thread(
 
 // ── Public C API ─────────────────────────────────────────────────────────────
 
-/// Configure the profiler before starting.
-///
-/// Must be called before `pyroscope_start`. Parameters:
-/// - `num_shards`: number of shards (0 = use default 16). Must be >= 1.
-/// - `queue_size_kb`: per-shard queue size in KiB (ignored — set at compile
-///   time via `ring-512k` / `ring-1m` features; included for future use).
-/// - `log_enabled`: if nonzero, print diagnostic messages to stderr.
-///
-/// Returns 0 on success, 9 if the profiler is already running.
-///
-/// # Safety
-///
-/// Must be called from a single thread before `pyroscope_start`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pyroscope_configure(
-    num_shards: c_int,
-    _queue_size_kb: c_int,
-    log_enabled: c_int,
-) -> c_int {
-    if LIFECYCLE.load(Ordering::Acquire) != STATE_UNINITIALIZED {
-        return 9;
-    }
-
-    let num_shards = if num_shards <= 0 {
-        DEFAULT_NUM_SHARDS
-    } else {
-        num_shards as usize
-    };
-
-    let config = Config {
-        num_shards,
-        notify_interval: sig_ring::DEFAULT_NOTIFY_INTERVAL,
-        log_enabled: log_enabled != 0,
-    };
-
-    if config.log_enabled {
-        LOG_ENABLED.store(true, Ordering::Release);
-        eprintln!(
-            "pyroscope_cpython: configured num_shards={}, ring_size={}KiB, logging=on",
-            config.num_shards,
-            RING_SIZE / 1024,
-        );
-    }
-
-    if let Ok(mut guard) = CONFIG.lock() {
-        *guard = Some(config);
-    }
-
-    0
-}
-
 /// Start the CPython profiler.
 ///
 /// Runs the full init sequence: kindasafe crash recovery, Python binary
@@ -293,16 +227,33 @@ pub unsafe extern "C" fn pyroscope_configure(
 /// TLS offset discovery, ring buffer allocation, reader thread spawn,
 /// then installs a SIGPROF handler + 10 ms timer.
 ///
-/// Returns 0 on success, nonzero error code on failure.
+/// Parameters:
+/// - `app_name`: application name (NUL-terminated C string, or null).
+/// - `server_url`: server URL (NUL-terminated C string, or null).
+/// - `num_shards`: number of shards (0 = use default 16). Must be >= 1.
+/// - `log_enabled`: if nonzero, print diagnostic messages to stderr.
+///
+/// Returns 0 on success, nonzero error code on failure:
+/// - 1: kindasafe init failed
+/// - 2: Python binary not found
+/// - 3: ELF symbol not found
+/// - 4: debug offsets validation failed
+/// - 5: unsupported Python version
+/// - 6: TLS discovery failed
+/// - 7: memory allocation / resource creation failed
+/// - 8: signal handler installation failed
+/// - 9: profiler already running
 ///
 /// # Safety
 ///
 /// `app_name` and `server_url` must be valid pointers to NUL-terminated
-/// C strings, or null (which returns error code 1).
+/// C strings, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pyroscope_start(
     _app_name: *const c_char,
     _server_url: *const c_char,
+    num_shards: c_int,
+    log_enabled: c_int,
 ) -> c_int {
     if LIFECYCLE
         .compare_exchange(
@@ -313,68 +264,76 @@ pub unsafe extern "C" fn pyroscope_start(
         )
         .is_err()
     {
-        return 9;
+        return ERR_ALREADY_RUNNING;
     }
 
-    match init_sequence() {
+    if log_enabled != 0 {
+        LOG_ENABLED.store(true, Ordering::Release);
+    }
+
+    let num_shards = if num_shards <= 0 {
+        DEFAULT_NUM_SHARDS
+    } else {
+        num_shards as usize
+    };
+
+    log_info(&format!(
+        "configured num_shards={}, ring_size={}KiB",
+        num_shards,
+        RING_SIZE / 1024,
+    ));
+
+    match init_sequence(num_shards) {
         Ok(()) => 0,
         Err(code) => {
-            log_error!("init failed with code {}", code);
+            log_error(&format!("init failed with code {}", code));
             LIFECYCLE.store(STATE_UNINITIALIZED, Ordering::Release);
             code
         }
     }
 }
 
-fn init_sequence() -> Result<(), c_int> {
-    // Take config (or use defaults).
-    let config = CONFIG
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take())
-        .unwrap_or_default();
+fn init_sequence(num_shards: usize) -> Result<(), c_int> {
+    let notify_interval = sig_ring::DEFAULT_NOTIFY_INTERVAL;
 
-    let num_shards = config.num_shards;
-    let notify_interval = config.notify_interval;
-
-    log_info!(
+    log_info(&format!(
         "starting init: num_shards={}, ring_size={}KiB, notify_interval={}",
         num_shards,
         RING_SIZE / 1024,
         notify_interval,
-    );
+    ));
 
     // Step 1: Install kindasafe SIGSEGV/SIGBUS recovery.
     kindasafe_init::init().map_err(|_| {
-        log_error!("kindasafe_init failed");
-        1
+        log_error("kindasafe_init failed");
+        ERR_KINDASAFE_INIT
     })?;
-    log_info!("kindasafe_init ok");
+    log_info("kindasafe_init ok");
 
     // Step 2: Find Python binary in /proc/self/maps.
     let binary = python_offsets::find_python_in_maps().map_err(|e| {
-        log_error!("find_python_in_maps: {:?}", e);
+        log_error(&format!("find_python_in_maps: {:?}", e));
         map_init_error(&e)
     })?;
-    log_info!("found Python binary");
+    log_info("found Python binary");
 
     // Step 3: Resolve _PyRuntime and Py_Version ELF symbols.
     let symbols = python_offsets::resolve_elf_symbols(&binary).map_err(|e| {
-        log_error!("resolve_elf_symbols: {:?}", e);
+        log_error(&format!("resolve_elf_symbols: {:?}", e));
         map_init_error(&e)
     })?;
-    log_info!("resolved ELF symbols");
+    log_info("resolved ELF symbols");
 
     // Step 4: Detect and validate Python version.
     let version = python_offsets::detect_version(symbols.py_version_addr).map_err(|e| {
-        log_error!("detect_version: {:?}", e);
+        log_error(&format!("detect_version: {:?}", e));
         map_init_error(&e)
     })?;
-    log_info!("detected Python version: {:?}", version);
+    log_info(&format!("detected Python version: {:?}", version));
 
     // Read raw version hex (needed by read_debug_offsets).
     let version_hex = python_offsets::read_version_hex(symbols.py_version_addr).map_err(|e| {
-        log_error!("read_version_hex: {:?}", e);
+        log_error(&format!("read_version_hex: {:?}", e));
         map_init_error(&e)
     })?;
 
@@ -382,17 +341,17 @@ fn init_sequence() -> Result<(), c_int> {
     let debug_offsets =
         python_offsets::read_debug_offsets(symbols.py_runtime_addr, &version, version_hex)
             .map_err(|e| {
-                log_error!("read_debug_offsets: {:?}", e);
+                log_error(&format!("read_debug_offsets: {:?}", e));
                 map_init_error(&e)
             })?;
-    log_info!("read debug offsets");
+    log_info("read debug offsets");
 
     // Step 6: Discover TLS offset for _PyThreadState_GetCurrent.
     let tls_offset = python_offsets::find_tls_offset(&binary).map_err(|e| {
-        log_error!("find_tls_offset: {:?}", e);
+        log_error(&format!("find_tls_offset: {:?}", e));
         map_init_error(&e)
     })?;
-    log_info!("TLS offset: 0x{:x}", tls_offset);
+    log_info(&format!("TLS offset: 0x{:x}", tls_offset));
 
     // Step 7: Allocate bbqueue buffers and split into producer/consumer pairs.
     let mut producers: Vec<Option<FrameProducer<'static, RING_SIZE>>> =
@@ -404,21 +363,21 @@ fn init_sequence() -> Result<(), c_int> {
         let bb = Box::new(bbqueue::BBBuffer::<RING_SIZE>::new());
         let bb: &'static bbqueue::BBBuffer<RING_SIZE> = Box::leak(bb);
         let (prod, cons) = bb.try_split_framed().map_err(|_| {
-            log_error!("bbqueue split failed for shard {}", i);
-            7
+            log_error(&format!("bbqueue split failed for shard {}", i));
+            ERR_ALLOC_FAILED
         })?;
         producers[i] = Some(prod);
         consumers[i] = Some(cons);
     }
-    log_info!("allocated {} ring buffers", num_shards);
+    log_info(&format!("allocated {} ring buffers", num_shards));
 
     // Step 8: Create eventfd for reader thread notification.
     let eventfd = notlibc::EventFd::new().map_err(|_| {
-        log_error!("eventfd creation failed");
-        7
+        log_error("eventfd creation failed");
+        ERR_ALLOC_FAILED
     })?;
 
-    // Step 9: Build shard vec.
+    // Step 9: Build shard and consumer vecs.
     let empty_frame = RawFrame {
         code_object: 0,
         instr_offset: 0,
@@ -432,9 +391,10 @@ fn init_sequence() -> Result<(), c_int> {
         })
         .collect();
 
-    // Unwrap consumers into a vec.
-    let consumers: Vec<FrameConsumer<'static, RING_SIZE>> =
-        consumers.into_iter().map(|c| c.unwrap()).collect();
+    let consumers: Vec<UnsafeCell<FrameConsumer<'static, RING_SIZE>>> = consumers
+        .into_iter()
+        .map(|c| UnsafeCell::new(c.unwrap()))
+        .collect();
 
     // Step 10: Publish handler state.
     let type_addrs = python_unwind::TypeAddrs {
@@ -445,6 +405,7 @@ fn init_sequence() -> Result<(), c_int> {
         tls_offset,
         type_addrs,
         shards,
+        consumers,
         eventfd,
         samples_since_notify: AtomicU32::new(0),
         num_shards,
@@ -459,19 +420,19 @@ fn init_sequence() -> Result<(), c_int> {
     // Step 11: Spawn reader thread.
     std::thread::Builder::new()
         .name("pyroscope-reader".into())
-        .spawn(move || reader_thread(state, consumers))
+        .spawn(move || reader_thread(state))
         .map_err(|_| {
-            log_error!("failed to spawn reader thread");
-            7
+            log_error("failed to spawn reader thread");
+            ERR_ALLOC_FAILED
         })?;
 
     // Steps 12+13: Install SIGPROF handler and start 10 ms ITIMER_PROF timer.
     sighandler::start(on_sigprof).map_err(|_| {
-        log_error!("signal handler installation failed");
-        8
+        log_error("signal handler installation failed");
+        ERR_SIGNAL_HANDLER
     })?;
 
-    log_info!("init complete");
+    log_info("init complete");
     notlibc::debug::puts("pyroscope_cpython: init complete");
     Ok(())
 }
@@ -479,13 +440,13 @@ fn init_sequence() -> Result<(), c_int> {
 /// Map `python_offsets::InitError` variants to integer error codes.
 fn map_init_error(err: &python_offsets::InitError) -> c_int {
     match err {
-        python_offsets::InitError::KindasafeInitFailed => 1,
-        python_offsets::InitError::PythonNotFound => 2,
-        python_offsets::InitError::Io => 2,
-        python_offsets::InitError::SymbolNotFound(_) => 3,
-        python_offsets::InitError::ElfParse => 3,
-        python_offsets::InitError::DebugOffsetsMismatch => 4,
-        python_offsets::InitError::UnsupportedVersion => 5,
-        python_offsets::InitError::TlsDiscoveryFailed => 6,
+        python_offsets::InitError::KindasafeInitFailed => ERR_KINDASAFE_INIT,
+        python_offsets::InitError::PythonNotFound => ERR_PYTHON_NOT_FOUND,
+        python_offsets::InitError::Io => ERR_PYTHON_NOT_FOUND,
+        python_offsets::InitError::SymbolNotFound(_) => ERR_SYMBOL_NOT_FOUND,
+        python_offsets::InitError::ElfParse => ERR_SYMBOL_NOT_FOUND,
+        python_offsets::InitError::DebugOffsetsMismatch => ERR_DEBUG_OFFSETS_MISMATCH,
+        python_offsets::InitError::UnsupportedVersion => ERR_UNSUPPORTED_VERSION,
+        python_offsets::InitError::TlsDiscoveryFailed => ERR_TLS_DISCOVERY_FAILED,
     }
 }
