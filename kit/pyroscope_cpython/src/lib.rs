@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bbqueue::framed::{FrameConsumer, FrameProducer};
 use python_offsets_types::py313;
@@ -207,10 +207,10 @@ fn resolve_function_name(code_object: u64, offsets: &py313::_Py_DebugOffsets) ->
 // ── Reader thread ────────────────────────────────────────────────────────────
 
 /// Reader thread entry point. Wakes on eventfd or timeout, drains all shard
-/// consumers, accumulates symbolized stacks for 15 seconds, then builds a
-/// pprof profile and optionally sends it to Pyroscope.
+/// consumers, symbolizes and feeds samples directly into the ProfileBuilder.
+/// Every 15 seconds the builder is encoded to pprof and optionally sent to
+/// Pyroscope, then reset for the next window.
 fn reader_thread(state: &'static HandlerState) {
-    // Set up epoll to wait on the eventfd.
     let mut event_set = match notlibc::EventSet::new() {
         Ok(es) => es,
         Err(_) => {
@@ -229,9 +229,9 @@ fn reader_thread(state: &'static HandlerState) {
     ));
 
     let flush_interval = Duration::from_secs(15);
+    let period: i64 = 10_000_000; // 10 ms
     let mut last_flush = Instant::now();
-    // Map from stack (Vec of function names, leaf-first) to hit count.
-    let mut accumulated: HashMap<Vec<String>, u64> = HashMap::new();
+    let mut builder = pprof_enc::ProfileBuilder::new(0, flush_interval.as_nanos() as i64, period);
     // Cache: code_object address → resolved function name.
     let mut symbol_cache: HashMap<u64, String> = HashMap::new();
 
@@ -241,7 +241,7 @@ fn reader_thread(state: &'static HandlerState) {
         let timeout_ms = remaining.as_millis() as i32;
         let _ = event_set.wait(timeout_ms);
 
-        // Phase 2: Drain all shards, symbolize, accumulate.
+        // Phase 2: Drain all shards, symbolize, feed into builder.
         let offsets = &state.debug_offsets;
         let log = LOG_ENABLED.load(Ordering::Relaxed);
 
@@ -251,27 +251,39 @@ fn reader_thread(state: &'static HandlerState) {
 
             while let Some(grant) = consumer.read() {
                 if let Some(record) = sig_ring::parse_record(&grant) {
-                    let mut stack: Vec<String> = Vec::with_capacity(record.depth as usize);
+                    let depth = record.depth as usize;
 
-                    for i in 0..record.depth as usize {
-                        let frame = record.frame(i);
-                        let name = symbol_cache
-                            .entry(frame.code_object)
-                            .or_insert_with(|| resolve_function_name(frame.code_object, offsets))
-                            .clone();
-                        stack.push(name);
+                    // Ensure all code objects are in the cache (mutable pass).
+                    for i in 0..depth {
+                        let raw = record.frame(i);
+                        symbol_cache
+                            .entry(raw.code_object)
+                            .or_insert_with(|| resolve_function_name(raw.code_object, offsets));
                     }
 
+                    // Build frames from cached names (immutable pass).
+                    let frames: Vec<pprof_enc::Frame<'_>> = (0..depth)
+                        .map(|i| {
+                            let raw = record.frame(i);
+                            pprof_enc::Frame {
+                                function_name: symbol_cache[&raw.code_object].as_str(),
+                                filename: "",
+                                first_line: 0,
+                            }
+                        })
+                        .collect();
+
                     if log {
+                        let names: Vec<&str> = frames.iter().map(|f| f.function_name).collect();
                         eprintln!(
                             "pyroscope_cpython: reader: tid=0x{:x} depth={} [{}]",
                             record.tid,
-                            record.depth,
-                            stack.join(" < "),
+                            depth,
+                            names.join(" < "),
                         );
                     }
 
-                    *accumulated.entry(stack).or_insert(0) += 1;
+                    builder.add_sample(&frames, 1);
                 }
                 grant.release();
             }
@@ -279,58 +291,37 @@ fn reader_thread(state: &'static HandlerState) {
 
         // Phase 3: Flush when 15 seconds have elapsed.
         if last_flush.elapsed() >= flush_interval {
-            flush_pprof(state, &accumulated);
-            accumulated.clear();
+            flush_pprof(state, &mut builder);
             symbol_cache.clear();
             last_flush = Instant::now();
         }
     }
 }
 
-/// Build a pprof profile from accumulated stacks and optionally send it.
-fn flush_pprof(state: &'static HandlerState, accumulated: &HashMap<Vec<String>, u64>) {
-    if accumulated.is_empty() {
+/// Encode the accumulated profile, optionally send it, then reset the builder.
+fn flush_pprof(state: &'static HandlerState, builder: &mut pprof_enc::ProfileBuilder) {
+    if builder.is_empty() {
         log_info("flush: no samples, skipping");
         return;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let until_secs = now.as_secs();
-    let from_secs = until_secs.saturating_sub(15);
-    let time_nanos = (from_secs as i64) * 1_000_000_000;
-    let duration_nanos: i64 = 15_000_000_000;
-    let period: i64 = 10_000_000; // 10 ms
-
-    let mut builder = pprof_enc::ProfileBuilder::new(time_nanos, duration_nanos, period);
-
-    let mut total_samples: u64 = 0;
-    for (stack, &count) in accumulated {
-        let frames: Vec<pprof_enc::Frame> = stack
-            .iter()
-            .map(|name| pprof_enc::Frame {
-                function_name: name.clone(),
-                filename: String::new(),
-                first_line: 0,
-            })
-            .collect();
-        builder.add_sample(&frames, count as i64);
-        total_samples += count;
-    }
-
+    let num_stacks = builder.len();
     match builder.encode() {
         Ok(pprof_gz) => {
             log_info(&format!(
-                "flush: {} unique stacks, {} total samples, pprof {} bytes",
-                accumulated.len(),
-                total_samples,
+                "flush: {} unique stacks, pprof {} bytes",
+                num_stacks,
                 pprof_gz.len(),
             ));
 
             if let Some(ref url) = state.server_url {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let from_secs = now_secs.saturating_sub(15);
                 if let Err(e) =
-                    pyroscope_ingest::send(url, &state.app_name, &pprof_gz, from_secs, until_secs)
+                    pyroscope_ingest::send(url, &state.app_name, &pprof_gz, from_secs, now_secs)
                 {
                     log_error(&format!("ingest send failed: {}", e));
                 }
@@ -340,6 +331,12 @@ fn flush_pprof(state: &'static HandlerState, accumulated: &HashMap<Vec<String>, 
             log_error(&format!("pprof encode failed: {}", e));
         }
     }
+
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    builder.reset(now_nanos, 15_000_000_000);
 }
 
 // ── Public C API ─────────────────────────────────────────────────────────────
