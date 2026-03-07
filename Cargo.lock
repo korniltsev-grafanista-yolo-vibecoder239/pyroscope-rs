@@ -2370,6 +2370,7 @@ name = "python_unwind"
 version = "0.1.0"
 dependencies = [
  "kindasafe",
+ "notlibc",
  "python_offsets_types",
 ]
 
