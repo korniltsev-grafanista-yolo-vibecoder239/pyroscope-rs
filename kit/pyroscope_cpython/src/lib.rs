@@ -1,15 +1,66 @@
 use core::ffi::{c_char, c_int, c_void};
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use bbqueue::framed::{FrameConsumer, FrameProducer};
 use python_offsets_types::py313;
 use python_unwind::RawFrame;
-use sig_ring::{NOTIFY_INTERVAL, NUM_SHARDS, RING_SIZE};
+use sig_ring::RING_SIZE;
 
 const STATE_UNINITIALIZED: u32 = 0;
 const STATE_RUNNING: u32 = 1;
 
 static LIFECYCLE: AtomicU32 = AtomicU32::new(STATE_UNINITIALIZED);
+
+/// Whether to log diagnostic messages to stderr. Off by default.
+/// Set via `pyroscope_configure` before calling `pyroscope_start`.
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Write a message to stderr when logging is enabled.
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        if LOG_ENABLED.load(Ordering::Relaxed) {
+            eprintln!("pyroscope_cpython: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+/// Write an error message to stderr when logging is enabled.
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        if LOG_ENABLED.load(Ordering::Relaxed) {
+            eprintln!("pyroscope_cpython ERROR: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+// ── Configuration ────────────────────────────────────────────────────────────
+
+/// Runtime configuration for the profiler.
+///
+/// All fields have reasonable defaults matching the original hardcoded values.
+/// Call `pyroscope_configure` before `pyroscope_start` to override.
+struct Config {
+    /// Number of shards for concurrent signal handler access (default: 16).
+    num_shards: usize,
+    /// Notify the reader thread every N successful sample writes (default: 32).
+    notify_interval: u32,
+    /// Enable diagnostic logging to stderr (default: false).
+    log_enabled: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            num_shards: sig_ring::DEFAULT_NUM_SHARDS,
+            notify_interval: sig_ring::DEFAULT_NOTIFY_INTERVAL,
+            log_enabled: false,
+        }
+    }
+}
+
+/// Global config, set before start. Protected by LIFECYCLE state machine:
+/// only written when STATE_UNINITIALIZED, only read during init_sequence.
+static CONFIG: std::sync::Mutex<Option<Config>> = std::sync::Mutex::new(None);
 
 // ── Per-shard state ──────────────────────────────────────────────────────────
 
@@ -33,9 +84,13 @@ struct HandlerState {
     tls_offset: u64,
     /// Expected type-object addresses for runtime type checking.
     type_addrs: python_unwind::TypeAddrs,
-    shards: [notlibc::ShardMutex<Shard>; NUM_SHARDS],
+    /// Dynamically-sized shard array (length = config.num_shards).
+    shards: Vec<notlibc::ShardMutex<Shard>>,
     eventfd: notlibc::EventFd,
     samples_since_notify: AtomicU32,
+    /// Cached config values used in the signal handler hot path.
+    num_shards: usize,
+    notify_interval: u32,
 }
 
 // SAFETY: HandlerState is initialized once and then only accessed via:
@@ -75,11 +130,12 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
 
     // Step 4: Select shard via gettid, try-lock with 3 fallback attempts.
     let tid = notlibc::gettid();
-    let base = tid as usize % NUM_SHARDS;
+    let num_shards = state.num_shards;
+    let base = tid as usize % num_shards;
 
     let mut guard = None;
     for attempt in 0..3 {
-        let idx = (base + attempt) % NUM_SHARDS;
+        let idx = (base + attempt) % num_shards;
         if let Some(g) = state.shards[idx].try_lock() {
             guard = Some(g);
             break;
@@ -110,7 +166,7 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
 
     // Step 7: Notify reader thread periodically.
     let total = state.samples_since_notify.fetch_add(1, Ordering::Relaxed);
-    if total % NOTIFY_INTERVAL == 0 {
+    if total % state.notify_interval == 0 {
         state.eventfd.notify();
     }
 }
@@ -121,16 +177,22 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
 /// shard consumers, and debug-prints the received stacks.
 fn reader_thread(
     state: &'static HandlerState,
-    mut consumers: [FrameConsumer<'static, RING_SIZE>; NUM_SHARDS],
+    mut consumers: Vec<FrameConsumer<'static, RING_SIZE>>,
 ) {
     // Set up epoll to wait on the eventfd.
     let mut event_set = match notlibc::EventSet::new() {
         Ok(es) => es,
-        Err(_) => return,
+        Err(_) => {
+            log_error!("reader: failed to create EventSet");
+            return;
+        }
     };
     if event_set.add(&state.eventfd).is_err() {
+        log_error!("reader: failed to add eventfd to EventSet");
         return;
     }
+
+    log_info!("reader thread started, {} shards", consumers.len());
 
     loop {
         // Wait for eventfd notification or 15s timeout.
@@ -170,6 +232,57 @@ fn reader_thread(
 
 // ── Public C API ─────────────────────────────────────────────────────────────
 
+/// Configure the profiler before starting.
+///
+/// Must be called before `pyroscope_start`. Parameters:
+/// - `num_shards`: number of shards (0 = use default 16). Must be >= 1.
+/// - `queue_size_kb`: per-shard queue size in KiB (ignored — set at compile
+///   time via `ring-512k` / `ring-1m` features; included for future use).
+/// - `log_enabled`: if nonzero, print diagnostic messages to stderr.
+///
+/// Returns 0 on success, 9 if the profiler is already running.
+///
+/// # Safety
+///
+/// Must be called from a single thread before `pyroscope_start`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pyroscope_configure(
+    num_shards: c_int,
+    _queue_size_kb: c_int,
+    log_enabled: c_int,
+) -> c_int {
+    if LIFECYCLE.load(Ordering::Acquire) != STATE_UNINITIALIZED {
+        return 9;
+    }
+
+    let num_shards = if num_shards <= 0 {
+        sig_ring::DEFAULT_NUM_SHARDS
+    } else {
+        num_shards as usize
+    };
+
+    let config = Config {
+        num_shards,
+        notify_interval: sig_ring::DEFAULT_NOTIFY_INTERVAL,
+        log_enabled: log_enabled != 0,
+    };
+
+    if config.log_enabled {
+        LOG_ENABLED.store(true, Ordering::Release);
+        eprintln!(
+            "pyroscope_cpython: configured num_shards={}, ring_size={}KiB, logging=on",
+            config.num_shards,
+            RING_SIZE / 1024,
+        );
+    }
+
+    if let Ok(mut guard) = CONFIG.lock() {
+        *guard = Some(config);
+    }
+
+    0
+}
+
 /// Start the CPython profiler.
 ///
 /// Runs the full init sequence: kindasafe crash recovery, Python binary
@@ -203,6 +316,7 @@ pub unsafe extern "C" fn pyroscope_start(
     match init_sequence() {
         Ok(()) => 0,
         Err(code) => {
+            log_error!("init failed with code {}", code);
             LIFECYCLE.store(STATE_UNINITIALIZED, Ordering::Release);
             code
         }
@@ -210,63 +324,114 @@ pub unsafe extern "C" fn pyroscope_start(
 }
 
 fn init_sequence() -> Result<(), c_int> {
+    // Take config (or use defaults).
+    let config = CONFIG
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .unwrap_or_default();
+
+    let num_shards = config.num_shards;
+    let notify_interval = config.notify_interval;
+
+    log_info!(
+        "starting init: num_shards={}, ring_size={}KiB, notify_interval={}",
+        num_shards,
+        RING_SIZE / 1024,
+        notify_interval,
+    );
+
     // Step 1: Install kindasafe SIGSEGV/SIGBUS recovery.
-    kindasafe_init::init().map_err(|_| 1)?;
+    kindasafe_init::init().map_err(|_| {
+        log_error!("kindasafe_init failed");
+        1
+    })?;
+    log_info!("kindasafe_init ok");
 
     // Step 2: Find Python binary in /proc/self/maps.
-    let binary = python_offsets::find_python_in_maps().map_err(|e| map_init_error(&e))?;
+    let binary = python_offsets::find_python_in_maps().map_err(|e| {
+        log_error!("find_python_in_maps: {:?}", e);
+        map_init_error(&e)
+    })?;
+    log_info!("found Python binary");
 
     // Step 3: Resolve _PyRuntime and Py_Version ELF symbols.
-    let symbols = python_offsets::resolve_elf_symbols(&binary).map_err(|e| map_init_error(&e))?;
+    let symbols = python_offsets::resolve_elf_symbols(&binary).map_err(|e| {
+        log_error!("resolve_elf_symbols: {:?}", e);
+        map_init_error(&e)
+    })?;
+    log_info!("resolved ELF symbols");
 
     // Step 4: Detect and validate Python version.
-    let version =
-        python_offsets::detect_version(symbols.py_version_addr).map_err(|e| map_init_error(&e))?;
+    let version = python_offsets::detect_version(symbols.py_version_addr).map_err(|e| {
+        log_error!("detect_version: {:?}", e);
+        map_init_error(&e)
+    })?;
+    log_info!("detected Python version: {:?}", version);
 
     // Read raw version hex (needed by read_debug_offsets).
-    let version_hex = python_offsets::read_version_hex(symbols.py_version_addr)
-        .map_err(|e| map_init_error(&e))?;
+    let version_hex = python_offsets::read_version_hex(symbols.py_version_addr).map_err(|e| {
+        log_error!("read_version_hex: {:?}", e);
+        map_init_error(&e)
+    })?;
 
     // Step 5: Read _Py_DebugOffsets from _PyRuntime.
     let debug_offsets =
         python_offsets::read_debug_offsets(symbols.py_runtime_addr, &version, version_hex)
-            .map_err(|e| map_init_error(&e))?;
+            .map_err(|e| {
+                log_error!("read_debug_offsets: {:?}", e);
+                map_init_error(&e)
+            })?;
+    log_info!("read debug offsets");
 
     // Step 6: Discover TLS offset for _PyThreadState_GetCurrent.
-    let tls_offset = python_offsets::find_tls_offset(&binary).map_err(|e| map_init_error(&e))?;
+    let tls_offset = python_offsets::find_tls_offset(&binary).map_err(|e| {
+        log_error!("find_tls_offset: {:?}", e);
+        map_init_error(&e)
+    })?;
+    log_info!("TLS offset: 0x{:x}", tls_offset);
 
     // Step 7: Allocate bbqueue buffers and split into producer/consumer pairs.
-    let mut producers: [Option<FrameProducer<'static, RING_SIZE>>; NUM_SHARDS] =
-        core::array::from_fn(|_| None);
-    let mut consumers: [Option<FrameConsumer<'static, RING_SIZE>>; NUM_SHARDS] =
-        core::array::from_fn(|_| None);
+    let mut producers: Vec<Option<FrameProducer<'static, RING_SIZE>>> =
+        (0..num_shards).map(|_| None).collect();
+    let mut consumers: Vec<Option<FrameConsumer<'static, RING_SIZE>>> =
+        (0..num_shards).map(|_| None).collect();
 
-    for i in 0..NUM_SHARDS {
+    for i in 0..num_shards {
         let bb = Box::new(bbqueue::BBBuffer::<RING_SIZE>::new());
         let bb: &'static bbqueue::BBBuffer<RING_SIZE> = Box::leak(bb);
-        let (prod, cons) = bb.try_split_framed().map_err(|_| 7)?;
+        let (prod, cons) = bb.try_split_framed().map_err(|_| {
+            log_error!("bbqueue split failed for shard {}", i);
+            7
+        })?;
         producers[i] = Some(prod);
         consumers[i] = Some(cons);
     }
+    log_info!("allocated {} ring buffers", num_shards);
 
     // Step 8: Create eventfd for reader thread notification.
-    let eventfd = notlibc::EventFd::new().map_err(|_| 7)?;
+    let eventfd = notlibc::EventFd::new().map_err(|_| {
+        log_error!("eventfd creation failed");
+        7
+    })?;
 
-    // Step 9: Build shard array.
+    // Step 9: Build shard vec.
     let empty_frame = RawFrame {
         code_object: 0,
         instr_offset: 0,
     };
-    let shards: [notlibc::ShardMutex<Shard>; NUM_SHARDS] = core::array::from_fn(|i| {
-        notlibc::ShardMutex::new(Shard {
-            frame_buffer: [empty_frame; python_unwind::MAX_DEPTH],
-            producer: producers[i].take().unwrap(),
+    let shards: Vec<notlibc::ShardMutex<Shard>> = (0..num_shards)
+        .map(|i| {
+            notlibc::ShardMutex::new(Shard {
+                frame_buffer: [empty_frame; python_unwind::MAX_DEPTH],
+                producer: producers[i].take().unwrap(),
+            })
         })
-    });
+        .collect();
 
-    // Unwrap consumers into a fixed-size array.
-    let consumers: [FrameConsumer<'static, RING_SIZE>; NUM_SHARDS] =
-        core::array::from_fn(|i| consumers[i].take().unwrap());
+    // Unwrap consumers into a vec.
+    let consumers: Vec<FrameConsumer<'static, RING_SIZE>> =
+        consumers.into_iter().map(|c| c.unwrap()).collect();
 
     // Step 10: Publish handler state.
     let type_addrs = python_unwind::TypeAddrs {
@@ -279,6 +444,8 @@ fn init_sequence() -> Result<(), c_int> {
         shards,
         eventfd,
         samples_since_notify: AtomicU32::new(0),
+        num_shards,
+        notify_interval,
     });
     let state: &'static HandlerState = unsafe { &*Box::into_raw(state) };
     HANDLER_STATE.store(
@@ -290,11 +457,18 @@ fn init_sequence() -> Result<(), c_int> {
     std::thread::Builder::new()
         .name("pyroscope-reader".into())
         .spawn(move || reader_thread(state, consumers))
-        .map_err(|_| 7)?;
+        .map_err(|_| {
+            log_error!("failed to spawn reader thread");
+            7
+        })?;
 
     // Steps 12+13: Install SIGPROF handler and start 10 ms ITIMER_PROF timer.
-    sighandler::start(on_sigprof).map_err(|_| 8)?;
+    sighandler::start(on_sigprof).map_err(|_| {
+        log_error!("signal handler installation failed");
+        8
+    })?;
 
+    log_info!("init complete");
     notlibc::debug::puts("pyroscope_cpython: init complete");
     Ok(())
 }

@@ -2,20 +2,20 @@
 """
 Smoke test for pyroscope_cpython cdylib.
 
-Loads the .so via ctypes, calls pyroscope_start(), then burns CPU
-for a few seconds. In debug builds, the SIGPROF handler prints
-"SIGPROF fired" to stdout via raw SYS_write.
+Loads the .so via ctypes, calls pyroscope_configure() to enable logging,
+then pyroscope_start(), then burns CPU for a few seconds.
 
 Run with:
     cargo build -p pyroscope_cpython
     python3 kit/pyroscope_cpython/tests/test_cpython.py
 
-Expected output (debug build):
+Expected output:
+    pyroscope_cpython: configured num_shards=16, ring_size=256KiB, logging=on
+    pyroscope_cpython: starting init: num_shards=16, ...
     pyroscope_start returned: 0
     second pyroscope_start returned: 9
     Burning CPU for 3 seconds...
-    SIGPROF fired
-    SIGPROF fired
+    reader: tid=...
     ...
     done
 """
@@ -54,6 +54,15 @@ def main():
     lib_path = find_library()
     print(f"Loading: {lib_path}")
     lib = ctypes.CDLL(lib_path)
+
+    # Configure before starting: enable logging to stderr.
+    lib.pyroscope_configure.restype = ctypes.c_int
+    lib.pyroscope_configure.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+    # num_shards=0 (use default 16), queue_size_kb=0 (use default), log_enabled=1
+    rc_cfg = lib.pyroscope_configure(0, 0, 1)
+    print(f"pyroscope_configure returned: {rc_cfg}")
+    assert rc_cfg == 0, f"Expected 0, got {rc_cfg}"
 
     lib.pyroscope_start.restype = ctypes.c_int
     lib.pyroscope_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
