@@ -423,6 +423,9 @@ fn init_sequence(num_shards: usize) -> Result<(), InitError> {
     log_info(&format!("TLS offset: 0x{:x}", tls_offset));
 
     // Step 6b: Validate TLS offset by reading tstate and checking native_thread_id.
+    // tstate may be NULL at init time (e.g. when called via ctypes before the
+    // interpreter has set TLS for this thread). That is fine — the signal handler
+    // already handles NULL tstate. We only fail if tstate is non-zero but invalid.
     {
         let fs_base = kindasafe::fs_0x0().map_err(|_| {
             log_error("TLS validation: failed to read fs_base");
@@ -437,33 +440,30 @@ fn init_sequence(num_shards: usize) -> Result<(), InitError> {
             InitError::TlsDiscoveryFailed
         })?;
         if tstate == 0 {
-            log_error(&format!(
-                "TLS validation: tstate is NULL (fs_base=0x{:x}, tls_offset=0x{:x})",
-                fs_base, tls_offset
-            ));
-            return Err(InitError::TlsDiscoveryFailed);
-        }
-        let native_tid = kindasafe::u64(tstate + debug_offsets.thread_state.native_thread_id)
-            .map_err(|_| {
+            log_info("TLS validation: tstate is NULL (will be set later by interpreter)");
+        } else {
+            let native_tid = kindasafe::u64(tstate + debug_offsets.thread_state.native_thread_id)
+                .map_err(|_| {
                 log_error(&format!(
                     "TLS validation: failed to read native_thread_id from tstate=0x{:x}",
                     tstate
                 ));
                 InitError::TlsDiscoveryFailed
             })?;
-        let expected_tid = notlibc::gettid() as u64;
-        if native_tid != expected_tid {
-            log_error(&format!(
-                "TLS validation FAILED: native_thread_id={} but gettid()={} \
-                 (tstate=0x{:x}, fs_base=0x{:x}, tls_offset=0x{:x})",
-                native_tid, expected_tid, tstate, fs_base, tls_offset
+            let expected_tid = notlibc::gettid() as u64;
+            if native_tid != expected_tid {
+                log_error(&format!(
+                    "TLS validation FAILED: native_thread_id={} but gettid()={} \
+                     (tstate=0x{:x}, fs_base=0x{:x}, tls_offset=0x{:x})",
+                    native_tid, expected_tid, tstate, fs_base, tls_offset
+                ));
+                return Err(InitError::TlsDiscoveryFailed);
+            }
+            log_info(&format!(
+                "TLS validation passed: tstate=0x{:x}, native_thread_id={}",
+                tstate, native_tid
             ));
-            return Err(InitError::TlsDiscoveryFailed);
         }
-        log_info(&format!(
-            "TLS validation passed: tstate=0x{:x}, native_thread_id={}",
-            tstate, native_tid
-        ));
     }
 
     // Step 7: Allocate bbqueue buffers and split into producer/consumer pairs.
