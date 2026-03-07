@@ -31,6 +31,8 @@ struct Shard {
 struct HandlerState {
     debug_offsets: py313::_Py_DebugOffsets,
     tls_offset: u64,
+    /// Expected type-object addresses for runtime type checking.
+    type_addrs: python_unwind::TypeAddrs,
     shards: [notlibc::ShardMutex<Shard>; NUM_SHARDS],
     eventfd: notlibc::EventFd,
     samples_since_notify: AtomicU32,
@@ -89,7 +91,12 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
     };
 
     // Step 5: Unwind Python stack into the shard's pre-allocated frame buffer.
-    let depth = python_unwind::unwind(tstate, &state.debug_offsets, &mut guard.frame_buffer);
+    let depth = python_unwind::unwind(
+        tstate,
+        &state.debug_offsets,
+        &state.type_addrs,
+        &mut guard.frame_buffer,
+    );
     if depth == 0 {
         return;
     }
@@ -145,7 +152,7 @@ fn reader_thread(
 
                     for i in 0..record.depth as usize {
                         let frame = record.frame(i);
-                        notlibc::debug::writes("  [");
+                        notlibc::debug::writes("  reader: [");
                         notlibc::debug::write_hex(i);
                         notlibc::debug::writes("] code=0x");
                         notlibc::debug::write_hex(frame.code_object as usize);
@@ -262,9 +269,13 @@ fn init_sequence() -> Result<(), c_int> {
         core::array::from_fn(|i| consumers[i].take().unwrap());
 
     // Step 10: Publish handler state.
+    let type_addrs = python_unwind::TypeAddrs {
+        code_type: symbols.py_code_type_addr,
+    };
     let state = Box::new(HandlerState {
         debug_offsets,
         tls_offset,
+        type_addrs,
         shards,
         eventfd,
         samples_since_notify: AtomicU32::new(0),
@@ -294,7 +305,7 @@ fn map_init_error(err: &python_offsets::InitError) -> c_int {
         python_offsets::InitError::KindasafeInitFailed => 1,
         python_offsets::InitError::PythonNotFound => 2,
         python_offsets::InitError::Io => 2,
-        python_offsets::InitError::SymbolNotFound => 3,
+        python_offsets::InitError::SymbolNotFound(_) => 3,
         python_offsets::InitError::ElfParse => 3,
         python_offsets::InitError::DebugOffsetsMismatch => 4,
         python_offsets::InitError::UnsupportedVersion => 5,
