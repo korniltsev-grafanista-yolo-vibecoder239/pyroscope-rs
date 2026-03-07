@@ -2,10 +2,6 @@
 
 use python_unwind::RawFrame;
 
-/// Default number of shards for concurrent signal handler access.
-/// Can be overridden at runtime via `pyroscope_cpython::Config::num_shards`.
-pub const DEFAULT_NUM_SHARDS: usize = 16;
-
 /// Default size of each per-shard bbqueue buffer in bytes (256 KiB).
 /// Can be overridden at compile time via the `ring-512k` or `ring-1m` features.
 #[cfg(feature = "ring-1m")]

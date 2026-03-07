@@ -9,6 +9,9 @@ use sig_ring::RING_SIZE;
 const STATE_UNINITIALIZED: u32 = 0;
 const STATE_RUNNING: u32 = 1;
 
+/// Default number of shards for concurrent signal handler access.
+const DEFAULT_NUM_SHARDS: usize = 16;
+
 static LIFECYCLE: AtomicU32 = AtomicU32::new(STATE_UNINITIALIZED);
 
 /// Whether to log diagnostic messages to stderr. Off by default.
@@ -51,7 +54,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            num_shards: sig_ring::DEFAULT_NUM_SHARDS,
+            num_shards: DEFAULT_NUM_SHARDS,
             notify_interval: sig_ring::DEFAULT_NOTIFY_INTERVAL,
             log_enabled: false,
         }
@@ -256,7 +259,7 @@ pub unsafe extern "C" fn pyroscope_configure(
     }
 
     let num_shards = if num_shards <= 0 {
-        sig_ring::DEFAULT_NUM_SHARDS
+        DEFAULT_NUM_SHARDS
     } else {
         num_shards as usize
     };
