@@ -1,6 +1,8 @@
 use core::cell::UnsafeCell;
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bbqueue::framed::{FrameConsumer, FrameProducer};
 use python_offsets_types::py313;
@@ -81,6 +83,8 @@ struct HandlerState {
     samples_since_notify: AtomicU32,
     num_shards: usize,
     notify_interval: u32,
+    app_name: String,
+    server_url: Option<String>,
 }
 
 // SAFETY: HandlerState is initialized once and then only accessed via:
@@ -161,10 +165,50 @@ extern "C" fn on_sigprof(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_
     }
 }
 
+// ── Symbolization helper ─────────────────────────────────────────────────────
+
+/// Resolve the function name for a code object via `co_qualname` (with
+/// `co_name` fallback). Returns an owned `String`, or `"<unknown>"` if
+/// resolution fails.
+fn resolve_function_name(code_object: u64, offsets: &py313::_Py_DebugOffsets) -> String {
+    let mut name_buf = [0u8; 256];
+
+    // Try co_qualname first.
+    if let Ok(qualname_ptr) = kindasafe::u64(code_object + offsets.code_object.qualname) {
+        if qualname_ptr != 0 {
+            if let Ok(name) = kindasafe::str(
+                &mut name_buf,
+                qualname_ptr + offsets.unicode_object.asciiobject_size,
+            ) {
+                if !name.is_empty() {
+                    return name.to_owned();
+                }
+            }
+        }
+    }
+
+    // Fallback to co_name.
+    if let Ok(name_ptr) = kindasafe::u64(code_object + offsets.code_object.name) {
+        if name_ptr != 0 {
+            if let Ok(name) = kindasafe::str(
+                &mut name_buf,
+                name_ptr + offsets.unicode_object.asciiobject_size,
+            ) {
+                if !name.is_empty() {
+                    return name.to_owned();
+                }
+            }
+        }
+    }
+
+    "<unknown>".to_owned()
+}
+
 // ── Reader thread ────────────────────────────────────────────────────────────
 
-/// Reader thread entry point. Wakes on eventfd or 15s timeout, drains all
-/// shard consumers, and debug-prints the received stacks.
+/// Reader thread entry point. Wakes on eventfd or timeout, drains all shard
+/// consumers, accumulates symbolized stacks for 15 seconds, then builds a
+/// pprof profile and optionally sends it to Pyroscope.
 fn reader_thread(state: &'static HandlerState) {
     // Set up epoll to wait on the eventfd.
     let mut event_set = match notlibc::EventSet::new() {
@@ -184,80 +228,115 @@ fn reader_thread(state: &'static HandlerState) {
         state.num_shards
     ));
 
+    let flush_interval = Duration::from_secs(15);
+    let mut last_flush = Instant::now();
+    // Map from stack (Vec of function names, leaf-first) to hit count.
+    let mut accumulated: HashMap<Vec<String>, u64> = HashMap::new();
+    // Cache: code_object address → resolved function name.
+    let mut symbol_cache: HashMap<u64, String> = HashMap::new();
+
     loop {
-        // Wait for eventfd notification or 15s timeout.
-        let _ = event_set.wait(15_000);
+        // Phase 1: Wait with dynamic timeout so flush happens on time.
+        let remaining = flush_interval.saturating_sub(last_flush.elapsed());
+        let timeout_ms = remaining.as_millis() as i32;
+        let _ = event_set.wait(timeout_ms);
 
-        // Drain all shards.
+        // Phase 2: Drain all shards, symbolize, accumulate.
+        let offsets = &state.debug_offsets;
+        let log = LOG_ENABLED.load(Ordering::Relaxed);
+
         for shard_idx in 0..state.num_shards {
-            // Lock the shard to ensure no signal handler is mid-write.
             let _shard_guard = state.shards[shard_idx].lock();
-
-            // SAFETY: consumers are only accessed by the reader thread.
             let consumer = unsafe { &mut *state.consumers[shard_idx].get() };
 
-            // Drain all available frames from this shard's consumer.
             while let Some(grant) = consumer.read() {
                 if let Some(record) = sig_ring::parse_record(&grant) {
-                    notlibc::debug::writes("reader: tid=");
-                    notlibc::debug::write_hex(record.tid as usize);
-                    notlibc::debug::writes(" depth=");
-                    notlibc::debug::write_hex(record.depth as usize);
-                    notlibc::debug::puts("");
+                    let mut stack: Vec<String> = Vec::with_capacity(record.depth as usize);
 
-                    let offsets = &state.debug_offsets;
                     for i in 0..record.depth as usize {
                         let frame = record.frame(i);
-                        notlibc::debug::writes("  reader: [");
-                        notlibc::debug::write_hex(i);
-                        notlibc::debug::writes("] code=0x");
-                        notlibc::debug::write_hex(frame.code_object as usize);
-                        notlibc::debug::writes(" instr=0x");
-                        notlibc::debug::write_hex(frame.instr_offset as usize);
-
-                        // Symbolize: read co_qualname (or co_name fallback)
-                        let mut name_buf = [0u8; 256];
-                        let mut resolved = false;
-                        if let Ok(qualname_ptr) =
-                            kindasafe::u64(frame.code_object + offsets.code_object.qualname)
-                        {
-                            if qualname_ptr != 0 {
-                                if let Ok(name) = kindasafe::str(
-                                    &mut name_buf,
-                                    qualname_ptr + offsets.unicode_object.asciiobject_size,
-                                ) {
-                                    if !name.is_empty() {
-                                        notlibc::debug::writes(" ");
-                                        notlibc::debug::writes(name);
-                                        resolved = true;
-                                    }
-                                }
-                            }
-                        }
-                        if !resolved {
-                            if let Ok(name_ptr) =
-                                kindasafe::u64(frame.code_object + offsets.code_object.name)
-                            {
-                                if name_ptr != 0 {
-                                    if let Ok(name) = kindasafe::str(
-                                        &mut name_buf,
-                                        name_ptr + offsets.unicode_object.asciiobject_size,
-                                    ) {
-                                        if !name.is_empty() {
-                                            notlibc::debug::writes(" ");
-                                            notlibc::debug::writes(name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        notlibc::debug::puts("");
+                        let name = symbol_cache
+                            .entry(frame.code_object)
+                            .or_insert_with(|| resolve_function_name(frame.code_object, offsets))
+                            .clone();
+                        stack.push(name);
                     }
-                }
 
+                    if log {
+                        eprintln!(
+                            "pyroscope_cpython: reader: tid=0x{:x} depth={} [{}]",
+                            record.tid,
+                            record.depth,
+                            stack.join(" < "),
+                        );
+                    }
+
+                    *accumulated.entry(stack).or_insert(0) += 1;
+                }
                 grant.release();
             }
+        }
+
+        // Phase 3: Flush when 15 seconds have elapsed.
+        if last_flush.elapsed() >= flush_interval {
+            flush_pprof(state, &accumulated);
+            accumulated.clear();
+            last_flush = Instant::now();
+        }
+    }
+}
+
+/// Build a pprof profile from accumulated stacks and optionally send it.
+fn flush_pprof(state: &'static HandlerState, accumulated: &HashMap<Vec<String>, u64>) {
+    if accumulated.is_empty() {
+        log_info("flush: no samples, skipping");
+        return;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let until_secs = now.as_secs();
+    let from_secs = until_secs.saturating_sub(15);
+    let time_nanos = (from_secs as i64) * 1_000_000_000;
+    let duration_nanos: i64 = 15_000_000_000;
+    let period: i64 = 10_000_000; // 10 ms
+
+    let mut builder = pprof_enc::ProfileBuilder::new(time_nanos, duration_nanos, period);
+
+    let mut total_samples: u64 = 0;
+    for (stack, &count) in accumulated {
+        let frames: Vec<pprof_enc::Frame> = stack
+            .iter()
+            .map(|name| pprof_enc::Frame {
+                function_name: name.clone(),
+                filename: String::new(),
+                first_line: 0,
+            })
+            .collect();
+        builder.add_sample(&frames, count as i64);
+        total_samples += count;
+    }
+
+    match builder.encode() {
+        Ok(pprof_gz) => {
+            log_info(&format!(
+                "flush: {} unique stacks, {} total samples, pprof {} bytes",
+                accumulated.len(),
+                total_samples,
+                pprof_gz.len(),
+            ));
+
+            if let Some(ref url) = state.server_url {
+                if let Err(e) =
+                    pyroscope_ingest::send(url, &state.app_name, &pprof_gz, from_secs, until_secs)
+                {
+                    log_error(&format!("ingest send failed: {}", e));
+                }
+            }
+        }
+        Err(e) => {
+            log_error(&format!("pprof encode failed: {}", e));
         }
     }
 }
@@ -294,8 +373,8 @@ fn reader_thread(state: &'static HandlerState) {
 /// C strings, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pyroscope_start(
-    _app_name: *const c_char,
-    _server_url: *const c_char,
+    app_name: *const c_char,
+    server_url: *const c_char,
     num_shards: c_int,
     log_enabled: c_int,
 ) -> c_int {
@@ -321,13 +400,29 @@ pub unsafe extern "C" fn pyroscope_start(
         num_shards as usize
     };
 
+    let app_name = if app_name.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(app_name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let server_url = if server_url.is_null() {
+        None
+    } else {
+        let s = unsafe { CStr::from_ptr(server_url) }
+            .to_string_lossy()
+            .into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    };
+
     log_info(&format!(
         "configured num_shards={}, ring_size={}KiB",
         num_shards,
         RING_SIZE / 1024,
     ));
 
-    match init_sequence(num_shards) {
+    match init_sequence(num_shards, app_name, server_url) {
         Ok(()) => 0,
         Err(code) => {
             log_error(&format!("init failed with code {}", code as c_int));
@@ -337,7 +432,11 @@ pub unsafe extern "C" fn pyroscope_start(
     }
 }
 
-fn init_sequence(num_shards: usize) -> Result<(), InitError> {
+fn init_sequence(
+    num_shards: usize,
+    app_name: String,
+    server_url: Option<String>,
+) -> Result<(), InitError> {
     let notify_interval = sig_ring::DEFAULT_NOTIFY_INTERVAL;
 
     log_info(&format!(
@@ -454,6 +553,8 @@ fn init_sequence(num_shards: usize) -> Result<(), InitError> {
         samples_since_notify: AtomicU32::new(0),
         num_shards,
         notify_interval,
+        app_name,
+        server_url,
     });
     let state: &'static HandlerState = unsafe { &*Box::into_raw(state) };
     HANDLER_STATE.store(
