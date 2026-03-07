@@ -130,12 +130,12 @@ fn reader_thread(
         let _ = event_set.wait(15_000);
 
         // Drain all shards.
-        for shard_idx in 0..NUM_SHARDS {
+        for (shard_idx, consumer) in consumers.iter_mut().enumerate() {
             // Lock the shard to ensure no signal handler is mid-write.
             let _guard = state.shards[shard_idx].lock();
 
             // Drain all available frames from this shard's consumer.
-            while let Some(grant) = consumers[shard_idx].read() {
+            while let Some(grant) = consumer.read() {
                 if let Some(record) = sig_ring::parse_record(&grant) {
                     notlibc::debug::writes("reader: tid=");
                     notlibc::debug::write_hex(record.tid as usize);
