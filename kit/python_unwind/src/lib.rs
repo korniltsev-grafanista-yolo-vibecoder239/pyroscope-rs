@@ -91,11 +91,13 @@ pub fn unwind(
         if type_addrs.code_type != 0 {
             if let Ok(ob_type) = kindasafe::u64(code_obj + offsets.pyobject.ob_type) {
                 if ob_type != type_addrs.code_type {
-                    notlibc::debug::writes("python_unwind: type mismatch code_obj=0x");
+                    notlibc::debug::writes(
+                        "!!! ERROR python_unwind: ob_type mismatch for PyCodeObject at 0x",
+                    );
                     notlibc::debug::write_hex(code_obj as usize);
-                    notlibc::debug::writes(" expected=0x");
+                    notlibc::debug::writes(" expected PyCode_Type=0x");
                     notlibc::debug::write_hex(type_addrs.code_type as usize);
-                    notlibc::debug::writes(" got=0x");
+                    notlibc::debug::writes(" got ob_type=0x");
                     notlibc::debug::write_hex(ob_type as usize);
                     notlibc::debug::puts("");
                 }

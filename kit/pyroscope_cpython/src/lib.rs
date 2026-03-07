@@ -143,7 +143,7 @@ fn init_sequence() -> Result<(), c_int> {
 
     // Publish handler state before installing the signal handler.
     let type_addrs = python_unwind::TypeAddrs {
-        code_type: symbols.py_code_type_addr.unwrap_or(0),
+        code_type: symbols.py_code_type_addr,
     };
     let state = Box::new(HandlerState {
         debug_offsets,
@@ -168,7 +168,7 @@ fn map_init_error(err: &python_offsets::InitError) -> c_int {
         python_offsets::InitError::KindasafeInitFailed => 1,
         python_offsets::InitError::PythonNotFound => 2,
         python_offsets::InitError::Io => 2,
-        python_offsets::InitError::SymbolNotFound => 3,
+        python_offsets::InitError::SymbolNotFound(_) => 3,
         python_offsets::InitError::ElfParse => 3,
         python_offsets::InitError::DebugOffsetsMismatch => 4,
         python_offsets::InitError::UnsupportedVersion => 5,

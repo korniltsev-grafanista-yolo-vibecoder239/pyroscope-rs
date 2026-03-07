@@ -14,9 +14,10 @@ pub const COOKIE: u64 = 0x7970_6775_6265_6478;
 pub enum InitError {
     KindasafeInitFailed,
     PythonNotFound,
-    /// `_PyRuntime` or `Py_Version` symbol not found in the ELF dynamic symbol table.
+    /// A required ELF dynamic symbol was not found.
+    /// The contained `&str` names which symbol is missing.
     /// Corresponds to init error code 3.
-    SymbolNotFound,
+    SymbolNotFound(&'static str),
     DebugOffsetsMismatch,
     UnsupportedVersion,
     /// The ELF file could not be parsed.
@@ -53,15 +54,14 @@ pub struct ElfSymbols {
     pub py_runtime_addr: u64,
     pub py_version_addr: u64,
     /// Address of `PyCode_Type` (the type object for `PyCodeObject`).
-    /// `None` if the symbol was not found — type checking will be skipped.
-    pub py_code_type_addr: Option<u64>,
+    pub py_code_type_addr: u64,
 }
 
 /// Open and mmap `binary.path`, parse the ELF dynamic symbol table, find
 /// `_PyRuntime` and `Py_Version`, apply the ASLR load bias, and return their
 /// absolute runtime addresses.
 ///
-/// Returns [`InitError::SymbolNotFound`] (error code 3) if either symbol is absent.
+/// Returns [`InitError::SymbolNotFound`] (error code 3) if any required symbol is absent.
 pub fn resolve_elf_symbols(binary: &PythonBinary) -> Result<ElfSymbols, InitError> {
     let file = std::fs::File::open(&binary.path).map_err(|_| InitError::Io)?;
     // SAFETY: the file is a read-only view of an on-disk ELF; no other code
@@ -102,14 +102,15 @@ fn resolve_elf_symbols_from_bytes(data: &[u8], mapped_base: u64) -> Result<ElfSy
         }
     }
 
-    match (py_runtime, py_version) {
-        (Some(py_runtime_addr), Some(py_version_addr)) => Ok(ElfSymbols {
-            py_runtime_addr,
-            py_version_addr,
-            py_code_type_addr: py_code_type,
-        }),
-        _ => Err(InitError::SymbolNotFound),
-    }
+    let py_runtime_addr = py_runtime.ok_or(InitError::SymbolNotFound("_PyRuntime"))?;
+    let py_version_addr = py_version.ok_or(InitError::SymbolNotFound("Py_Version"))?;
+    let py_code_type_addr = py_code_type.ok_or(InitError::SymbolNotFound("PyCode_Type"))?;
+
+    Ok(ElfSymbols {
+        py_runtime_addr,
+        py_version_addr,
+        py_code_type_addr,
+    })
 }
 
 /// Read `Py_Version` from live memory, parse it, and validate it is a supported CPython version.
@@ -721,7 +722,7 @@ mod tests {
         let result = resolve_elf_symbols_from_bytes(LIBPYTHON314, 0).unwrap();
         assert_eq!(result.py_runtime_addr, 0x71bd00);
         assert_eq!(result.py_version_addr, 0x61c1b0);
-        assert_eq!(result.py_code_type_addr, Some(0x6e2b60));
+        assert_eq!(result.py_code_type_addr, 0x6e2b60);
     }
 
     #[test]
@@ -730,7 +731,7 @@ mod tests {
         let result = resolve_elf_symbols_from_bytes(LIBPYTHON314, mapped_base).unwrap();
         assert_eq!(result.py_runtime_addr, mapped_base + 0x71bd00);
         assert_eq!(result.py_version_addr, mapped_base + 0x61c1b0);
-        assert_eq!(result.py_code_type_addr, Some(mapped_base + 0x6e2b60));
+        assert_eq!(result.py_code_type_addr, mapped_base + 0x6e2b60);
     }
 
     #[test]
