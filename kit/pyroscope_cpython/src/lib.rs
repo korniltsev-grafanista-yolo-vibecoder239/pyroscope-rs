@@ -281,6 +281,7 @@ fn reader_thread(state: &'static HandlerState) {
         if last_flush.elapsed() >= flush_interval {
             flush_pprof(state, &accumulated);
             accumulated.clear();
+            symbol_cache.clear();
             last_flush = Instant::now();
         }
     }
