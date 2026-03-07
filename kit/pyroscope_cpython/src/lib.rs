@@ -20,15 +20,20 @@ static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // ── Error codes ──────────────────────────────────────────────────────────────
 
-const ERR_KINDASAFE_INIT: c_int = 1;
-const ERR_PYTHON_NOT_FOUND: c_int = 2;
-const ERR_SYMBOL_NOT_FOUND: c_int = 3;
-const ERR_DEBUG_OFFSETS_MISMATCH: c_int = 4;
-const ERR_UNSUPPORTED_VERSION: c_int = 5;
-const ERR_TLS_DISCOVERY_FAILED: c_int = 6;
-const ERR_ALLOC_FAILED: c_int = 7;
-const ERR_SIGNAL_HANDLER: c_int = 8;
-const ERR_ALREADY_RUNNING: c_int = 9;
+/// Error codes returned by `pyroscope_start`.
+#[repr(i32)]
+#[derive(Copy, Clone)]
+enum InitError {
+    KindasafeInit = 1,
+    PythonNotFound = 2,
+    SymbolNotFound = 3,
+    DebugOffsetsMismatch = 4,
+    UnsupportedVersion = 5,
+    TlsDiscoveryFailed = 6,
+    AllocFailed = 7,
+    SignalHandler = 8,
+    AlreadyRunning = 9,
+}
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -264,7 +269,7 @@ pub unsafe extern "C" fn pyroscope_start(
         )
         .is_err()
     {
-        return ERR_ALREADY_RUNNING;
+        return InitError::AlreadyRunning as c_int;
     }
 
     if log_enabled != 0 {
@@ -286,14 +291,14 @@ pub unsafe extern "C" fn pyroscope_start(
     match init_sequence(num_shards) {
         Ok(()) => 0,
         Err(code) => {
-            log_error(&format!("init failed with code {}", code));
+            log_error(&format!("init failed with code {}", code as c_int));
             LIFECYCLE.store(STATE_UNINITIALIZED, Ordering::Release);
-            code
+            code as c_int
         }
     }
 }
 
-fn init_sequence(num_shards: usize) -> Result<(), c_int> {
+fn init_sequence(num_shards: usize) -> Result<(), InitError> {
     let notify_interval = sig_ring::DEFAULT_NOTIFY_INTERVAL;
 
     log_info(&format!(
@@ -306,7 +311,7 @@ fn init_sequence(num_shards: usize) -> Result<(), c_int> {
     // Step 1: Install kindasafe SIGSEGV/SIGBUS recovery.
     kindasafe_init::init().map_err(|_| {
         log_error("kindasafe_init failed");
-        ERR_KINDASAFE_INIT
+        InitError::KindasafeInit
     })?;
     log_info("kindasafe_init ok");
 
@@ -364,7 +369,7 @@ fn init_sequence(num_shards: usize) -> Result<(), c_int> {
         let bb: &'static bbqueue::BBBuffer<RING_SIZE> = Box::leak(bb);
         let (prod, cons) = bb.try_split_framed().map_err(|_| {
             log_error(&format!("bbqueue split failed for shard {}", i));
-            ERR_ALLOC_FAILED
+            InitError::AllocFailed
         })?;
         producers[i] = Some(prod);
         consumers[i] = Some(cons);
@@ -374,7 +379,7 @@ fn init_sequence(num_shards: usize) -> Result<(), c_int> {
     // Step 8: Create eventfd for reader thread notification.
     let eventfd = notlibc::EventFd::new().map_err(|_| {
         log_error("eventfd creation failed");
-        ERR_ALLOC_FAILED
+        InitError::AllocFailed
     })?;
 
     // Step 9: Build shard and consumer vecs.
@@ -423,13 +428,13 @@ fn init_sequence(num_shards: usize) -> Result<(), c_int> {
         .spawn(move || reader_thread(state))
         .map_err(|_| {
             log_error("failed to spawn reader thread");
-            ERR_ALLOC_FAILED
+            InitError::AllocFailed
         })?;
 
     // Steps 12+13: Install SIGPROF handler and start 10 ms ITIMER_PROF timer.
     sighandler::start(on_sigprof).map_err(|_| {
         log_error("signal handler installation failed");
-        ERR_SIGNAL_HANDLER
+        InitError::SignalHandler
     })?;
 
     log_info("init complete");
@@ -437,16 +442,16 @@ fn init_sequence(num_shards: usize) -> Result<(), c_int> {
     Ok(())
 }
 
-/// Map `python_offsets::InitError` variants to integer error codes.
-fn map_init_error(err: &python_offsets::InitError) -> c_int {
+/// Map `python_offsets::InitError` variants to our `InitError` enum.
+fn map_init_error(err: &python_offsets::InitError) -> InitError {
     match err {
-        python_offsets::InitError::KindasafeInitFailed => ERR_KINDASAFE_INIT,
-        python_offsets::InitError::PythonNotFound => ERR_PYTHON_NOT_FOUND,
-        python_offsets::InitError::Io => ERR_PYTHON_NOT_FOUND,
-        python_offsets::InitError::SymbolNotFound(_) => ERR_SYMBOL_NOT_FOUND,
-        python_offsets::InitError::ElfParse => ERR_SYMBOL_NOT_FOUND,
-        python_offsets::InitError::DebugOffsetsMismatch => ERR_DEBUG_OFFSETS_MISMATCH,
-        python_offsets::InitError::UnsupportedVersion => ERR_UNSUPPORTED_VERSION,
-        python_offsets::InitError::TlsDiscoveryFailed => ERR_TLS_DISCOVERY_FAILED,
+        python_offsets::InitError::KindasafeInitFailed => InitError::KindasafeInit,
+        python_offsets::InitError::PythonNotFound => InitError::PythonNotFound,
+        python_offsets::InitError::Io => InitError::PythonNotFound,
+        python_offsets::InitError::SymbolNotFound(_) => InitError::SymbolNotFound,
+        python_offsets::InitError::ElfParse => InitError::SymbolNotFound,
+        python_offsets::InitError::DebugOffsetsMismatch => InitError::DebugOffsetsMismatch,
+        python_offsets::InitError::UnsupportedVersion => InitError::UnsupportedVersion,
+        python_offsets::InitError::TlsDiscoveryFailed => InitError::TlsDiscoveryFailed,
     }
 }
