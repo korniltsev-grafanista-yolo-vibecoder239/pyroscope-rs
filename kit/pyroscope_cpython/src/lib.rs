@@ -33,6 +33,7 @@ enum InitError {
     AllocFailed = 7,
     SignalHandler = 8,
     AlreadyRunning = 9,
+    KindasafeSanityCheck = 10,
 }
 
 // ── Logging ──────────────────────────────────────────────────────────────────
@@ -287,6 +288,7 @@ fn reader_thread(state: &'static HandlerState) {
 /// - 7: memory allocation / resource creation failed
 /// - 8: signal handler installation failed
 /// - 9: profiler already running
+/// - 10: kindasafe sanity check failed (crash recovery not working)
 ///
 /// # Safety
 ///
@@ -353,6 +355,13 @@ fn init_sequence(num_shards: usize) -> Result<(), InitError> {
         InitError::KindasafeInit
     })?;
     log_info("kindasafe_init ok");
+
+    // Step 1b: Verify crash recovery works (mmap PROT_NONE + read).
+    kindasafe_init::sanity_check().map_err(|_| {
+        log_error("kindasafe sanity check failed — crash recovery is not working");
+        InitError::KindasafeSanityCheck
+    })?;
+    log_info("kindasafe sanity check passed");
 
     // Step 2: Find Python binary in /proc/self/maps.
     let binary = python_offsets::find_python_in_maps().map_err(|e| {

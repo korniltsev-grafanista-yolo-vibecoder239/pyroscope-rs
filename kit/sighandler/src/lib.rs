@@ -28,8 +28,10 @@ unsafe fn register_sigaction(handler: HandlerFn) -> Result<(), Error> {
         new_action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
         libc::sigemptyset(&mut new_action.sa_mask);
         libc::sigaddset(&mut new_action.sa_mask, libc::SIGPROF);
-        libc::sigaddset(&mut new_action.sa_mask, libc::SIGSEGV);
-        libc::sigaddset(&mut new_action.sa_mask, libc::SIGBUS);
+        // NOTE: Do NOT add SIGSEGV/SIGBUS to sa_mask here.
+        // kindasafe relies on receiving SIGSEGV/SIGBUS during SIGPROF
+        // to safely recover from bad memory reads. Blocking them
+        // causes fatal crashes instead of graceful error returns.
         if libc::sigaction(libc::SIGPROF, &new_action, core::ptr::null_mut()) != 0 {
             return Err(Error::SigactionFailed);
         }
