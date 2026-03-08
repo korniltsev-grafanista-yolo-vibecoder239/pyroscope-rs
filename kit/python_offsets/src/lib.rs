@@ -425,13 +425,13 @@ fn resolve_asyncio_debug_symbol_from_bytes(
 /// Read `Py_AsyncioModuleDebugOffsets` from live memory at `addr`.
 pub fn read_asyncio_debug_offsets(
     addr: u64,
-) -> Result<py314::AsyncioModuleDebugOffsets, InitError> {
-    let mut buf = [0u8; size_of::<py314::AsyncioModuleDebugOffsets>()];
+) -> Result<py314::Py_AsyncioModuleDebugOffsets, InitError> {
+    let mut buf = [0u8; size_of::<py314::Py_AsyncioModuleDebugOffsets>()];
     kindasafe::slice(&mut buf, addr).map_err(|_| InitError::DebugOffsetsMismatch)?;
-    // SAFETY: AsyncioModuleDebugOffsets is #[repr(C)] with only u64 fields.
+    // SAFETY: Py_AsyncioModuleDebugOffsets is #[repr(C)] with only u64 fields.
     // Any bit pattern is valid.
     Ok(unsafe {
-        core::ptr::read_unaligned(buf.as_ptr() as *const py314::AsyncioModuleDebugOffsets)
+        core::ptr::read_unaligned(buf.as_ptr() as *const py314::Py_AsyncioModuleDebugOffsets)
     })
 }
 

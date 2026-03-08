@@ -77,7 +77,7 @@ struct HandlerState {
     /// Asyncio module debug offsets (`None` if `_asyncio` was not loaded at init).
     /// Used by the reader thread for walking suspended async tasks (future work).
     #[allow(dead_code)]
-    asyncio_offsets: Option<py314::AsyncioModuleDebugOffsets>,
+    asyncio_offsets: Option<py314::Py_AsyncioModuleDebugOffsets>,
     /// Dynamically-sized shard array (length = num_shards).
     shards: Vec<notlibc::ShardMutex<Shard>>,
     /// Per-shard bbqueue consumers. Only accessed by the reader thread.
