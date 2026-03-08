@@ -740,4 +740,26 @@ mod tests {
         let result = resolve_asyncio_debug_symbol_from_bytes(b"not an elf file", 0);
         assert_eq!(result, Err(InitError::ElfParse));
     }
+
+    // ── resolve_asyncio_debug_symbol_from_bytes against real _asyncio.so ─────
+
+    // Real _asyncio.cpython-314-x86_64-linux-gnu.so committed as a test fixture.
+    // The _AsyncioDebug symbol is only in the .AsyncioDebug ELF section (not .dynsym/.symtab).
+    // Section address verified with: readelf -S ... | grep AsyncioDebug → 0x117c0
+    const ASYNCIO_SO: &[u8] =
+        include_bytes!("../testdata/_asyncio.cpython-314-x86_64-linux-gnu.so");
+
+    #[test]
+    fn resolves_asyncio_debug_section() {
+        // mapped_base = 0 → load_bias = 0
+        let addr = resolve_asyncio_debug_symbol_from_bytes(ASYNCIO_SO, 0).unwrap();
+        assert_eq!(addr, 0x117c0, "expected .AsyncioDebug section address");
+    }
+
+    #[test]
+    fn resolves_asyncio_debug_with_load_bias() {
+        let mapped_base: u64 = 0x7f00_0000_0000;
+        let addr = resolve_asyncio_debug_symbol_from_bytes(ASYNCIO_SO, mapped_base).unwrap();
+        assert_eq!(addr, mapped_base + 0x117c0);
+    }
 }
