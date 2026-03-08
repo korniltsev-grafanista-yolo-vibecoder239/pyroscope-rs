@@ -199,3 +199,45 @@ pub struct _Py_DebugOffsets__debugger_support {
     pub debugger_script_path: u64,
     pub debugger_script_path_size: u64,
 }
+
+// ── Py_AsyncioModuleDebugOffsets ─────────────────────────────────────────────
+//
+// Exported by the `_asyncio` extension module as `_AsyncioDebug` in a
+// dedicated `.AsyncioDebug` ELF section.  Matches CPython 3.14
+// `Modules/_asynciomodule.c` layout.
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AsyncioModuleDebugOffsets {
+    pub asyncio_task_object: AsyncioModuleDebugOffsets__task_object,
+    pub asyncio_interpreter_state: AsyncioModuleDebugOffsets__interpreter_state,
+    pub asyncio_thread_state: AsyncioModuleDebugOffsets__thread_state,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AsyncioModuleDebugOffsets__task_object {
+    pub size: u64,
+    pub task_name: u64,
+    pub task_awaited_by: u64,
+    pub task_is_task: u64,
+    pub task_awaited_by_is_set: u64,
+    pub task_coro: u64,
+    pub task_node: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AsyncioModuleDebugOffsets__interpreter_state {
+    pub size: u64,
+    pub asyncio_tasks_head: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AsyncioModuleDebugOffsets__thread_state {
+    pub size: u64,
+    pub asyncio_running_loop: u64,
+    pub asyncio_running_task: u64,
+    pub asyncio_tasks_head: u64,
+}
