@@ -103,7 +103,9 @@ jobs:
             PYTHON_VERSION: "3.10"
           - variant: musllinux-arm64
             PYTHON_VERSION: "3.11"
-          # pysignalprof only supports glibc (manylinux), not musl
+          # pysignalprof only supports x86_64 glibc for now
+          - variant: manylinux-arm64
+            PYTHON_VERSION: "3.14"
           - variant: musllinux-amd64
             PYTHON_VERSION: "3.14"
           - variant: musllinux-arm64
