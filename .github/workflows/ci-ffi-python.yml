@@ -93,21 +93,8 @@ jobs:
           - variant: musllinux-arm64
             runs-on: ${{ github.repository_owner == 'grafana' && 'ubuntu-arm64-large' || 'ubuntu-24.04-arm' }}
             image-suffix: alpine
-          # per-version test configuration
-          - PYTHON_VERSION: "3.10"
-            test-script: /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py
-            docker-env: ""
-          - PYTHON_VERSION: "3.11"
-            test-script: /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py
-            docker-env: ""
-          - PYTHON_VERSION: "3.12"
-            test-script: /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py
-            docker-env: ""
-          - PYTHON_VERSION: "3.13"
-            test-script: /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py
-            docker-env: ""
+          # Python 3.14 uses pysignalprof instead of py-spy
           - PYTHON_VERSION: "3.14"
-            test-script: /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py
             docker-env: "-e PYROSCOPE_PYSIGNALPROF=true"
         exclude:
           # python:3.10/3.11-alpine arm64 tests hang indefinitely
@@ -134,7 +121,7 @@ jobs:
             ${{ matrix.docker-env }} \
             -v ${{ github.workspace }}:/pyroscope-rs \
             python:${{ matrix.PYTHON_VERSION }}-${{ matrix.image-suffix }} \
-            sh -c "pip install /pyroscope-rs/python/*.whl && python ${{ matrix.test-script }}"
+            sh -c "pip install /pyroscope-rs/python/*.whl && python /pyroscope-rs/pyroscope_ffi/python/scripts/tests/test.py"
 
   sdist-build:
     name: sdist
