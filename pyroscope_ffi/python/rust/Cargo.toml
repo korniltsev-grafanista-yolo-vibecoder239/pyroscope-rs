@@ -26,3 +26,4 @@ pysignalprof = { path = "../../../kit/pysignalprof" }
 default = ["rustls-tls"]
 rustls-tls = ["pyroscope/rustls-tls"]
 native-tls-vendored = ["pyroscope/native-tls-vendored"]
+debug-print = ["pysignalprof/debug-print"]
