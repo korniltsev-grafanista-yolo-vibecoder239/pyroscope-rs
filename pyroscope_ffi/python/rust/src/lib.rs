@@ -86,7 +86,22 @@ pub unsafe extern "C" fn initialize_agent(
         let log_enabled = std::env::var("RUST_LOG")
             .map(|v| v != "off")
             .unwrap_or(false);
-        return pysignalprof::start(application_name, server_url, 0, log_enabled).is_ok();
+        let tags_string = unsafe { CStr::from_ptr(tags) }.to_str().unwrap_or("");
+        let tags: Vec<(String, String)> = if tags_string.is_empty() {
+            Vec::new()
+        } else {
+            tags_string
+                .split(',')
+                .filter_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    match (parts.next(), parts.next()) {
+                        (Some(k), Some(v)) => Some((k.to_string(), v.to_string())),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        return pysignalprof::start(application_name, server_url, 0, log_enabled, tags).is_ok();
     }
 
     let basic_auth_username = unsafe { CStr::from_ptr(basic_auth_username) }
