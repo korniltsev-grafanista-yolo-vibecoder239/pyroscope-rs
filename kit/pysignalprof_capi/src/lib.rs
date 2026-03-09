@@ -7,7 +7,6 @@ use core::ffi::{CStr, c_char, c_int};
 /// Parameters:
 /// - `app_name`: application name (NUL-terminated C string, or null).
 /// - `server_url`: server URL (NUL-terminated C string, or null).
-/// - `tags`: comma-separated `key=val` pairs (NUL-terminated C string, or null).
 /// - `num_shards`: number of shards (0 = use default 16). Must be >= 1.
 /// - `log_enabled`: if nonzero, print diagnostic messages to stderr.
 ///
@@ -24,13 +23,12 @@ use core::ffi::{CStr, c_char, c_int};
 ///
 /// # Safety
 ///
-/// `app_name`, `server_url`, and `tags` must be valid pointers to NUL-terminated
+/// `app_name` and `server_url` must be valid pointers to NUL-terminated
 /// C strings, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pyroscope_start(
     app_name: *const c_char,
     server_url: *const c_char,
-    tags: *const c_char,
     num_shards: c_int,
     log_enabled: c_int,
 ) -> c_int {
@@ -51,32 +49,13 @@ pub unsafe extern "C" fn pyroscope_start(
         if s.is_empty() { None } else { Some(s) }
     };
 
-    let tags: Vec<(String, String)> = if tags.is_null() {
-        Vec::new()
-    } else {
-        let s = unsafe { CStr::from_ptr(tags) }.to_string_lossy();
-        if s.is_empty() {
-            Vec::new()
-        } else {
-            s.split(',')
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    match (parts.next(), parts.next()) {
-                        (Some(k), Some(v)) => Some((k.to_string(), v.to_string())),
-                        _ => None,
-                    }
-                })
-                .collect()
-        }
-    };
-
     let num_shards = if num_shards <= 0 {
         0
     } else {
         num_shards as usize
     };
 
-    match pysignalprof::start(app_name, server_url, num_shards, log_enabled != 0, tags) {
+    match pysignalprof::start(app_name, server_url, num_shards, log_enabled != 0, Vec::new()) {
         Ok(()) => 0,
         Err(code) => code as c_int,
     }
