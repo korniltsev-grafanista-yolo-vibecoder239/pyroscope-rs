@@ -72,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        PYTHON_VERSION: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        PYTHON_VERSION: ["3.10", "3.11", "3.12", "3.13"]
         variant:
           [
             "manylinux-amd64",
@@ -93,8 +93,11 @@ jobs:
           - variant: musllinux-arm64
             runs-on: ${{ github.repository_owner == 'grafana' && 'ubuntu-arm64-large' || 'ubuntu-24.04-arm' }}
             image-suffix: alpine
-          # Python 3.14 uses pysignalprof instead of py-spy
+          # Python 3.14 uses pysignalprof instead of py-spy (x86_64 glibc only)
           - PYTHON_VERSION: "3.14"
+            variant: manylinux-amd64
+            runs-on: ${{ github.repository_owner == 'grafana' && 'ubuntu-x64-large' || 'ubuntu-latest' }}
+            image-suffix: slim
             docker-env: "-e PYROSCOPE_PYSIGNALPROF=true"
         exclude:
           # python:3.10/3.11-alpine arm64 tests hang indefinitely
@@ -103,13 +106,6 @@ jobs:
             PYTHON_VERSION: "3.10"
           - variant: musllinux-arm64
             PYTHON_VERSION: "3.11"
-          # pysignalprof only supports x86_64 glibc for now
-          - variant: manylinux-arm64
-            PYTHON_VERSION: "3.14"
-          - variant: musllinux-amd64
-            PYTHON_VERSION: "3.14"
-          - variant: musllinux-arm64
-            PYTHON_VERSION: "3.14"
     needs: ["linux-build"]
     name: Linux Test - ${{ matrix.variant }} - ${{ matrix.PYTHON_VERSION }}
     runs-on: ${{ matrix.runs-on }}
