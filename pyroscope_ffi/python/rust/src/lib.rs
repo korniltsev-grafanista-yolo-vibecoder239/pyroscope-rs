@@ -87,20 +87,10 @@ pub unsafe extern "C" fn initialize_agent(
             .map(|v| v != "off")
             .unwrap_or(false);
         let tags_string = unsafe { CStr::from_ptr(tags) }.to_str().unwrap_or("");
-        let tags: Vec<(String, String)> = if tags_string.is_empty() {
-            Vec::new()
-        } else {
-            tags_string
-                .split(',')
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    match (parts.next(), parts.next()) {
-                        (Some(k), Some(v)) => Some((k.to_string(), v.to_string())),
-                        _ => None,
-                    }
-                })
-                .collect()
-        };
+        let tags: Vec<(String, String)> = string_to_tags(tags_string)
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
         return pysignalprof::start(application_name, server_url, 0, log_enabled, tags).is_ok();
     }
 
