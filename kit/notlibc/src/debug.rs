@@ -2,6 +2,12 @@
 //!
 //! Output is gated behind the `debug-print` Cargo feature (disabled by default).
 
+#[cfg(all(feature = "debug-print", target_arch = "x86_64", target_os = "linux"))]
+use crate::syscall_nr::x86_64::SYS_WRITE;
+
+#[cfg(feature = "debug-print")]
+const STDOUT: usize = 1;
+
 /// Write a string to stdout followed by a newline.
 ///
 /// This is a no-op unless the `debug-print` feature is enabled.
@@ -25,14 +31,8 @@ pub fn puts(_s: &str) {}
 #[cfg(feature = "debug-print")]
 #[inline(always)]
 pub fn writes(s: &str) {
-    const STDOUT: usize = 1;
     unsafe {
-        crate::syscall::syscall3(
-            crate::syscall_nr::x86_64::SYS_WRITE,
-            STDOUT,
-            s.as_ptr() as usize,
-            s.len(),
-        );
+        crate::syscall::syscall3(SYS_WRITE, STDOUT, s.as_ptr() as usize, s.len());
     }
 }
 
@@ -52,7 +52,6 @@ pub fn writes(_s: &str) {}
 #[cfg(feature = "debug-print")]
 #[inline(always)]
 pub fn write_hex(v: usize) {
-    const STDOUT: usize = 1;
     const HEX: &[u8] = b"0123456789abcdef";
     unsafe {
         let mut buf = [0u8; 16];
@@ -66,12 +65,7 @@ pub fn write_hex(v: usize) {
                 break;
             }
         }
-        crate::syscall::syscall3(
-            crate::syscall_nr::x86_64::SYS_WRITE,
-            STDOUT,
-            buf.as_ptr().add(i) as usize,
-            16 - i,
-        );
+        crate::syscall::syscall3(SYS_WRITE, STDOUT, buf.as_ptr().add(i) as usize, 16 - i);
     }
 }
 
